@@ -1,4 +1,4 @@
-workspace "Template"
+workspace "VCT_Experimental"
     architecture "x64"
     configurations { 
         "Debug", 
@@ -10,22 +10,33 @@ workspace "Template"
     IncDir["glad"] = "3rdparty/glad/include"
     IncDir["imgui"] = "3rdparty/imgui"
     IncDir["glm"] = "3rdparty/glm"
+	IncDir["assimp"] = "3rdparty/assimp/include"
+	IncDir["assimp_build"] = "3rdparty/assimp/build/include"
+	IncDir["stb"] = "3rdparty/stb"
 
     group "3rdparty"
     include "3rdparty/glfw"
     include "3rdparty/glad"
     include "3rdparty/imgui"
+    externalproject "assimp"
+        location "3rdparty/assimp/build/code"
+        kind "StaticLib"
+        language "C++"
+        configmap {
+            ["Debug"] = "Debug",
+            ["Release"] = "MinSizeRel"
+        }
     group ""
 
-    project "Template"
+    project "VCT_Experimental"
         kind "ConsoleApp"
         language "C++"
         cppdialect "C++17"
         targetdir "bin/%{prj.name}/%{cfg.buildcfg}"
         objdir "obj/%{prj.name}/%{cfg.buildcfg}"
-        vectorextensions "AVX2"
 
         links {
+			"assimp",
             "glad",
             "glfw",
             "imgui",
@@ -37,6 +48,9 @@ workspace "Template"
             "%{IncDir.glad}",
             "%{IncDir.imgui}",
             "%{IncDir.glm}",
+			"%{IncDir.assimp}",
+			"%{IncDir.assimp_build}",
+			"%{IncDir.stb}",
             "src"
         }
 
@@ -50,12 +64,9 @@ workspace "Template"
         }
 
         filter "system:windows"
-            staticruntime "on"
             systemversion "latest"
-            disablewarnings {
-                "26812"
-            }
-
+            disablewarnings { 26812 }
+			
         filter "configurations:Debug"
             symbols "on"
 
