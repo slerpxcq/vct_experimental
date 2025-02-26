@@ -1,4 +1,4 @@
-#include <iostream>
+#include "utils.h"
 
 #include <glad/gl.h>
 #include <GLFW/glfw3.h>
@@ -12,6 +12,7 @@
 #include <glm/gtc/type_ptr.hpp>
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/string_cast.hpp>
+#undef GLM_ENABLE_EXPERIMENTAL
 
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
@@ -20,6 +21,7 @@
 
 #include <stb_image.h>
 
+#include <iostream>
 #include <vector>
 #include <cassert>
 #include <filesystem>
@@ -64,11 +66,30 @@ struct Camera
     glm::mat4 matrix;
 };
 
+struct Settings
+{
+    bool showVoxels{ false };
+    bool showAABB{ false };
+    bool showWireframe{ false };
+    bool showMesh{ true };
+    bool showAxes{ false };
+};
+
+Settings g_settings;
 std::vector<Material> g_materials;
 std::vector<Mesh> g_meshes;
 Camera g_camera;
+GLFWwindow* g_window;
+glm::vec3 g_sceneAABB[2];
 
-GLuint g_shaderProgram;
+GLuint g_basicProgram;
+GLuint g_quadProgram;
+GLuint g_drawAABBProgram;
+GLuint g_drawAxesProgram;
+GLuint g_voxelizeProgram;
+GLuint g_drawVoxelsProgram;
+
+GLuint g_voxelTex;
 
 GLuint UploadTexture(void* img, uint32_t width, uint32_t height, uint32_t channels)
 {
@@ -108,7 +129,7 @@ std::string LoadText(const char* path)
 {
     std::ifstream ifs{ path };
     if (!ifs.is_open()) {
-        std::cerr << "Could not open file " << path << '\n';
+        std::cerr << "Could not open file \"" << path << "\"\n";
         std::terminate();
     }
     
@@ -117,10 +138,15 @@ std::string LoadText(const char* path)
     return ss.str();
 }
 
-void CompileShader(GLuint shader, const char* const* src)
+// Create and return the shader
+GLuint CompileShader(const char* srcPath, GLenum type)
 {
-    glShaderSource(shader, 1, src, nullptr);
+    GLuint shader = glCreateShader(type);
+    auto src = LoadText(srcPath);
+    auto srcCstr = src.c_str();
+    glShaderSource(shader, 1, &srcCstr, nullptr);
     glCompileShader(shader);
+
     int ok = 0;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
     if (!ok) {
@@ -129,37 +155,113 @@ void CompileShader(GLuint shader, const char* const* src)
         std::cerr << "Failed to compile shader: " << log << '\n';
         std::terminate();
     }
+
+    return shader;
+}
+
+void LinkProgram(GLuint program)
+{
+    glLinkProgram(program);
+
+    int ok = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        std::cerr << "Failed to link program: " << log << '\n';
+        std::terminate();
+    }
 }
 
 void LoadShaders()
 {
-    constexpr const char* VS_PATH = "resources/shaders/basic.vert";
-    constexpr const char* FS_PATH = "resources/shaders/basic.frag";
+    constexpr const char* BASIC_VS_PATH = "resources/shaders/basic.vert";
+    constexpr const char* BASIC_FS_PATH = "resources/shaders/basic.frag";
+    constexpr const char* QUAD_VS_PATH = "resources/shaders/quad.vert";
+    constexpr const char* QUAD_FS_PATH = "resources/shaders/quad.frag";
+    constexpr const char* DRAW_AABB_VS_PATH = "resources/shaders/draw_aabb.vert";
+    constexpr const char* DRAW_AABB_FS_PATH = "resources/shaders/draw_aabb.frag";
+    constexpr const char* DRAW_AXES_VS_PATH = "resources/shaders/draw_axes.vert";
+    constexpr const char* DRAW_AXES_FS_PATH = "resources/shaders/draw_axes.frag";
+    constexpr const char* VOXELIZE_VS_PATH = "resources/shaders/voxelize.vert";
+    constexpr const char* VOXELIZE_GS_PATH = "resources/shaders/voxelize.geom";
+    constexpr const char* VOXELIZE_FS_PATH = "resources/shaders/voxelize.frag";
+    constexpr const char* DRAW_VOXELS_VS_PATH = "resources/shaders/draw_voxels.vert";
+    constexpr const char* DRAW_VOXELS_GS_PATH = "resources/shaders/draw_voxels.geom";
+    constexpr const char* DRAW_VOXELS_FS_PATH = "resources/shaders/draw_voxels.frag";
 
-    auto vsSrc = LoadText(VS_PATH);
-    auto fsSrc = LoadText(FS_PATH);
-    auto vs = glCreateShader(GL_VERTEX_SHADER);
-    auto fs = glCreateShader(GL_FRAGMENT_SHADER);
-    auto ptr = vsSrc.c_str();
-    CompileShader(vs, &ptr);
-    ptr = fsSrc.c_str();
-    CompileShader(fs, &ptr);
-    g_shaderProgram = glCreateProgram();
-    glAttachShader(g_shaderProgram, vs);
-    glAttachShader(g_shaderProgram, fs);
-    glLinkProgram(g_shaderProgram);
+    GLuint basicVs = CompileShader(BASIC_VS_PATH, GL_VERTEX_SHADER);
+    GLuint basicFs = CompileShader(BASIC_FS_PATH, GL_FRAGMENT_SHADER);
+    GLuint quadVs = CompileShader(QUAD_VS_PATH, GL_VERTEX_SHADER);
+    GLuint quadFs = CompileShader(QUAD_FS_PATH, GL_FRAGMENT_SHADER);
+    GLuint drawAABBVs = CompileShader(DRAW_AABB_VS_PATH, GL_VERTEX_SHADER);
+    GLuint drawAABBFs = CompileShader(DRAW_AABB_FS_PATH, GL_FRAGMENT_SHADER);
+    GLuint drawAxesVs = CompileShader(DRAW_AXES_VS_PATH, GL_VERTEX_SHADER);
+    GLuint drawAxesFs = CompileShader(DRAW_AXES_FS_PATH, GL_FRAGMENT_SHADER);
+    GLuint voxelizeVs = CompileShader(VOXELIZE_VS_PATH, GL_VERTEX_SHADER);
+    GLuint voxelizeGs = CompileShader(VOXELIZE_GS_PATH, GL_GEOMETRY_SHADER);
+    GLuint voxelizeFs = CompileShader(VOXELIZE_FS_PATH, GL_FRAGMENT_SHADER);
+    GLuint drawVoxelsVs = CompileShader(DRAW_VOXELS_VS_PATH, GL_VERTEX_SHADER);
+    GLuint drawVoxelsGs = CompileShader(DRAW_VOXELS_GS_PATH, GL_GEOMETRY_SHADER);
+    GLuint drawVoxelsFs = CompileShader(DRAW_VOXELS_FS_PATH, GL_FRAGMENT_SHADER);
 
-    int ok = 0;
-    glGetProgramiv(g_shaderProgram, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[512];
-        glGetProgramInfoLog(g_shaderProgram, sizeof(log), nullptr, log);
-        std::cerr << "Failed to link program: " << log << '\n';
-        std::terminate();
+    g_basicProgram = glCreateProgram();
+    glAttachShader(g_basicProgram, basicVs);
+    glAttachShader(g_basicProgram, basicFs);
+    LinkProgram(g_basicProgram);
+    glDeleteShader(basicVs);
+    glDeleteShader(basicFs);
+
+    g_quadProgram = glCreateProgram();
+    glAttachShader(g_quadProgram, quadVs);
+    glAttachShader(g_quadProgram, quadFs);
+    LinkProgram(g_quadProgram);
+    glDeleteShader(quadVs);
+    glDeleteShader(quadFs);
+
+    g_drawAABBProgram = glCreateProgram();
+    glAttachShader(g_drawAABBProgram, drawAABBVs);
+    glAttachShader(g_drawAABBProgram, drawAABBFs);
+    LinkProgram(g_drawAABBProgram);
+    glDeleteShader(drawAABBVs);
+    glDeleteShader(drawAABBFs);
+
+    g_drawAxesProgram = glCreateProgram();
+    glAttachShader(g_drawAxesProgram, drawAxesVs);
+    glAttachShader(g_drawAxesProgram, drawAxesFs);
+    LinkProgram(g_drawAxesProgram);
+    glDeleteShader(drawAxesVs);
+    glDeleteShader(drawAxesFs);
+
+    g_voxelizeProgram = glCreateProgram();
+    glAttachShader(g_voxelizeProgram, voxelizeVs);
+    glAttachShader(g_voxelizeProgram, voxelizeGs);
+    glAttachShader(g_voxelizeProgram, voxelizeFs);
+    LinkProgram(g_voxelizeProgram);
+    glDeleteShader(voxelizeVs);
+    glDeleteShader(voxelizeGs);
+    glDeleteShader(voxelizeFs);
+
+    g_drawVoxelsProgram = glCreateProgram();
+    glAttachShader(g_drawVoxelsProgram, drawVoxelsVs);
+    glAttachShader(g_drawVoxelsProgram, drawVoxelsGs);
+    glAttachShader(g_drawVoxelsProgram, drawVoxelsFs);
+    LinkProgram(g_drawVoxelsProgram);
+    glDeleteShader(drawVoxelsVs);
+    glDeleteShader(drawVoxelsGs);
+    glDeleteShader(drawVoxelsFs);
+}
+
+void MergeAABB(const aiScene* scene, glm::vec3* outAABB)
+{
+    glm::vec3 min{ std::numeric_limits<float>::max() };
+    glm::vec3 max{ std::numeric_limits<float>::min() };
+    for (uint32_t i = 0; i < scene->mNumMeshes; ++i) {
+        min = glm::min(min, Cast<glm::vec3>(scene->mMeshes[i]->mAABB.mMin));
+        max = glm::max(max, Cast<glm::vec3>(scene->mMeshes[i]->mAABB.mMax));
     }
-
-    glDeleteShader(vs);
-    glDeleteShader(fs);
+    outAABB[0] = min;
+    outAABB[1] = max;
 }
 
 void LoadScene()
@@ -173,7 +275,8 @@ void LoadScene()
                                              aiProcess_CalcTangentSpace |
                                              aiProcess_Triangulate |
                                              aiProcess_JoinIdenticalVertices |
-                                             aiProcess_SortByPType);
+                                             aiProcess_SortByPType |
+                                             aiProcess_GenBoundingBoxes);
 
     if (!scene) {
         std::cerr << importer.GetErrorString() << std::endl;
@@ -185,6 +288,10 @@ void LoadScene()
     std::cout << "Material count: " << scene->mNumMaterials << '\n';
     std::cout << "Texture count: " << scene->mNumTextures << '\n';
     std::cout << "Material count: " << scene->mNumMaterials << '\n';
+
+    MergeAABB(scene, g_sceneAABB);
+    std::cout << "Scene AABB: " << glm::to_string(g_sceneAABB[0]) << ", "
+        << glm::to_string(g_sceneAABB[1]) << '\n';
 
     g_materials.resize(scene->mNumMaterials);
     g_meshes.resize(scene->mNumMeshes);
@@ -270,29 +377,105 @@ void LoadScene()
 	importer.FreeScene();
 }
 
-int main()
+void CreateWindow()
 {
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(WIDTH, HEIGHT, "LearnOpenGL", NULL, NULL);
-    glfwMakeContextCurrent(window);
-    if (window == NULL) {
-        std::cout << "Failed to create GLFW window" << std::endl;
+    g_window = glfwCreateWindow(WIDTH, HEIGHT, "LearnOpenGL", NULL, NULL);
+    glfwMakeContextCurrent(g_window);
+    if (g_window == NULL) {
+        std::cerr << "Failed to create GLFW g_window" << std::endl;
         glfwTerminate();
-        return -1;
+        std::terminate();
     }
 
     int version = gladLoadGL(glfwGetProcAddress);
     if (version == 0) {
-        std::cout << "Failed to initialize OpenGL context" << std::endl;
-        return -1;
+        std::cerr << "Failed to initialize OpenGL context" << std::endl;
+        std::terminate();
+    }
+}
+
+constexpr uint32_t VOXEL_RESOLUTION = 512;
+
+void VoxelizeScene()
+{
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+
+    GLint viewport[4];
+    glGetIntegerv(GL_VIEWPORT, viewport);
+
+    glProgramUniform3fv(g_voxelizeProgram, glGetUniformLocation(g_voxelizeProgram, "u_sceneAABB"), 2, glm::value_ptr(g_sceneAABB[0]));
+	glProgramUniform1ui(g_voxelizeProgram, glGetUniformLocation(g_voxelizeProgram, "u_voxelResolution"), VOXEL_RESOLUTION);
+    glUseProgram(g_voxelizeProgram);
+    glViewport(0, 0, VOXEL_RESOLUTION, VOXEL_RESOLUTION);
+
+    for (uint32_t i = 0; i < g_meshes.size(); ++i) {
+        glBindVertexArray(g_meshes[i].vao);
+        glDrawElements(GL_TRIANGLES, g_meshes[i].vertexCount, GL_UNSIGNED_INT, 0);
     }
 
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+}
+
+void UpdateCamera(float frameTimeMs)
+{
+	constexpr float MOVE_SPEED = 0.2f;
+	constexpr float ROTATE_SPEED = 1.f;
+
+	if (ImGui::IsKeyDown(ImGuiKey_W)) { // -z
+		g_camera.matrix[3] += glm::vec4(-MOVE_SPEED * glm::vec3(g_camera.matrix[2]) * frameTimeMs, 0);
+	}
+	if (ImGui::IsKeyDown(ImGuiKey_A)) { // -x
+		g_camera.matrix[3] += glm::vec4(-MOVE_SPEED * glm::vec3(g_camera.matrix[0]) * frameTimeMs, 0);
+	}
+	if (ImGui::IsKeyDown(ImGuiKey_S)) { // +z
+		g_camera.matrix[3] += glm::vec4(MOVE_SPEED * glm::vec3(g_camera.matrix[2]) * frameTimeMs, 0);
+	}
+	if (ImGui::IsKeyDown(ImGuiKey_D)) { // +x
+		g_camera.matrix[3] += glm::vec4(MOVE_SPEED * glm::vec3(g_camera.matrix[0]) * frameTimeMs, 0);
+	}
+	if (ImGui::IsKeyDown(ImGuiKey_LeftShift)) { // -y
+		g_camera.matrix[3] += glm::vec4(MOVE_SPEED * glm::vec3{ 0, -1, 0 } * frameTimeMs, 0);
+	}
+	if (ImGui::IsKeyDown(ImGuiKey_Space)) { // +y
+		g_camera.matrix[3] += glm::vec4(MOVE_SPEED * glm::vec3{ 0, 1, 0 } * frameTimeMs, 0);
+	}
+	if (ImGui::IsKeyDown(ImGuiKey_Q)) { // rotate ccw along y axis
+		g_camera.matrix = glm::rotate(g_camera.matrix, glm::radians(ROTATE_SPEED), glm::vec3{ 0, 1, 0 });
+	}
+	if (ImGui::IsKeyDown(ImGuiKey_E)) { // rotate cw along y axis
+		g_camera.matrix = glm::rotate(g_camera.matrix, -glm::radians(ROTATE_SPEED), glm::vec3{ 0, 1, 0 });
+	}
+}
+
+int main()
+{
+    CreateWindow();
     LoadShaders();
     LoadScene();
+
+    // VAO with no buffer binding, used when geometry is generated in shaders
+    GLuint genericDrawVao;
+    glCreateVertexArrays(1, &genericDrawVao);
+
+    // Create texture for voxelization
+    // atomicImageAdd could only operate on integer images 
+    constexpr GLuint VOXEL_IMAGE_BINDING = 0;
+    glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelTex);
+    glTextureStorage3D(g_voxelTex, 1, GL_R32UI, 
+                       VOXEL_RESOLUTION, 
+                       VOXEL_RESOLUTION, 
+                       VOXEL_RESOLUTION);
+    glBindImageTexture(VOXEL_IMAGE_BINDING, g_voxelTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    assert(glGetError() == GL_NO_ERROR);
+
 
     IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
@@ -307,7 +490,7 @@ int main()
 
 	ImGui::StyleColorsDark();
 
-	ImGui_ImplGlfw_InitForOpenGL(window, true);
+	ImGui_ImplGlfw_InitForOpenGL(g_window, true);
 	ImGui_ImplOpenGL3_Init("#version 460");
 
     g_camera.matrix = glm::lookAt(glm::vec3{ 0, 0, 0 },
@@ -317,12 +500,12 @@ int main()
     static float frameTimeMs;
     decltype(std::chrono::high_resolution_clock::now()) last;
 
-    while (!glfwWindowShouldClose(window))
+    while (!glfwWindowShouldClose(g_window))
     {
 		int32_t windowWidth, windowHeight;
-		glfwGetWindowSize(window, &windowWidth, &windowHeight);
-		glViewport(0, 0, windowWidth, windowHeight);
+		glfwGetWindowSize(g_window, &windowWidth, &windowHeight);
 
+        /******************************************** BEGIN UPDATE ********************************************/
         static glm::mat4 proj;
         if (windowWidth > 0 && windowHeight > 0)
 			proj = glm::perspective(glm::radians(60.f), static_cast<float>(windowWidth) / windowHeight, 0.1f, 10000.f);
@@ -331,74 +514,107 @@ int main()
         frameTimeMs = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count() / 1000.f;
         last = now;
 
-        glfwPollEvents();
+        UpdateCamera(frameTimeMs);
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         ImGui::DockSpaceOverViewport(nullptr, ImGuiDockNodeFlags_PassthruCentralNode);
 
-        constexpr float MOVE_SPEED = 0.2f;
-        constexpr float ROTATE_SPEED = 1.f;
+        /******************************************** END UPDATE ********************************************/
 
-        if (ImGui::IsKeyDown(ImGuiKey_W)) { // -z
-            g_camera.matrix[3] += glm::vec4(-MOVE_SPEED * glm::vec3(g_camera.matrix[2]) * frameTimeMs, 0);
-        }
-        if (ImGui::IsKeyDown(ImGuiKey_A)) { // -x
-            g_camera.matrix[3] += glm::vec4(-MOVE_SPEED * glm::vec3(g_camera.matrix[0]) * frameTimeMs, 0);
-        }
-        if (ImGui::IsKeyDown(ImGuiKey_S)) { // +z
-            g_camera.matrix[3] += glm::vec4(MOVE_SPEED * glm::vec3(g_camera.matrix[2]) * frameTimeMs, 0);
-        }
-        if (ImGui::IsKeyDown(ImGuiKey_D)) { // +x
-            g_camera.matrix[3] += glm::vec4(MOVE_SPEED * glm::vec3(g_camera.matrix[0]) * frameTimeMs, 0);
-        }
-        if (ImGui::IsKeyDown(ImGuiKey_LeftShift)) { // -y
-            g_camera.matrix[3] += glm::vec4(MOVE_SPEED * glm::vec3{ 0, -1, 0 } * frameTimeMs, 0);
-        }
-        if (ImGui::IsKeyDown(ImGuiKey_Space)) { // +y
-            g_camera.matrix[3] += glm::vec4(MOVE_SPEED * glm::vec3{ 0, 1, 0 } * frameTimeMs, 0);
-        }
-        if (ImGui::IsKeyDown(ImGuiKey_Q)) { // rotate ccw along y axis
-            g_camera.matrix = glm::rotate(g_camera.matrix, glm::radians(ROTATE_SPEED), glm::vec3{ 0, 1, 0 });
-        }
-        if (ImGui::IsKeyDown(ImGuiKey_E)) { // rotate cw along y axis
-            g_camera.matrix = glm::rotate(g_camera.matrix, -glm::radians(ROTATE_SPEED), glm::vec3{ 0, 1, 0 });
-        }
-
-        // Render
-        // Clear the colorbuffer
-        glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        glEnable(GL_DEPTH_TEST);
 
         /******************************************** BEGIN DRAW ********************************************/
-        glProgramUniformMatrix4fv(g_shaderProgram, glGetUniformLocation(g_shaderProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
-        glProgramUniformMatrix4fv(g_shaderProgram, glGetUniformLocation(g_shaderProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
+		VoxelizeScene();
 
-        for (uint32_t i = 0; i < g_meshes.size(); ++i) {
-			uint32_t hasMap[8] = { 0 };
-            auto mat = g_materials[g_meshes[i].materialIndex];
-            for (uint32_t j = 0; j < 8; ++j) {
-                auto tex = mat.maps[j];
-				if (tex) {
-                    glBindTextureUnit(j, tex);
-                    hasMap[j] = 1;
+        glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+		if (g_settings.showWireframe) {
+			glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+		}
+		else {
+			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+		}
+
+        if (g_settings.showMesh) {
+            for (uint32_t i = 0; i < g_meshes.size(); ++i) {
+                uint32_t hasMap[8] = { 0 };
+                auto mat = g_materials[g_meshes[i].materialIndex];
+                for (uint32_t j = 0; j < 8; ++j) {
+                    auto tex = mat.maps[j];
+                    if (tex) {
+                        glBindTextureUnit(j, tex);
+                        hasMap[j] = 1;
+                    }
                 }
+                glViewport(0, 0, windowWidth, windowHeight);
+                glEnable(GL_DEPTH_TEST);
+                glProgramUniform1uiv(g_basicProgram, glGetUniformLocation(g_basicProgram, "u_hasMap"), 8, hasMap);
+                glProgramUniformMatrix4fv(g_basicProgram, glGetUniformLocation(g_basicProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
+                glProgramUniformMatrix4fv(g_basicProgram, glGetUniformLocation(g_basicProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
+                glBindVertexArray(g_meshes[i].vao);
+                glUseProgram(g_basicProgram);
+                if (mat.twoSided) {
+                    glDisable(GL_CULL_FACE);
+                }
+                else {
+                    glEnable(GL_CULL_FACE);
+                    glFrontFace(GL_CCW);
+                }
+                glDrawElements(GL_TRIANGLES, g_meshes[i].vertexCount, GL_UNSIGNED_INT, 0);
             }
-            glProgramUniform1uiv(g_shaderProgram, glGetUniformLocation(g_shaderProgram, "u_hasMap"), 8, hasMap);
-            glBindVertexArray(g_meshes[i].vao);
-			glUseProgram(g_shaderProgram);
-            if (mat.twoSided) {
-                glDisable(GL_CULL_FACE);
-            } else {
-                glEnable(GL_CULL_FACE);
-                glFrontFace(GL_CCW);
-            }
-            glDrawElements(GL_TRIANGLES, g_meshes[i].vertexCount, GL_UNSIGNED_INT, 0);
         }
 
-        ImGui::ShowDemoWindow();
+        if (g_settings.showVoxels) { // draw voxelized scene
+			glViewport(0, 0, windowWidth, windowHeight);
+            // glEnable(GL_CULL_FACE);
+            glEnable(GL_DEPTH_TEST);
+			glProgramUniform3fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_sceneAABB"), 2, glm::value_ptr(g_sceneAABB[0]));
+			glProgramUniform1ui(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_voxelResolution"), VOXEL_RESOLUTION);
+			glProgramUniformMatrix4fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
+			glProgramUniformMatrix4fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
+            glUseProgram(g_drawVoxelsProgram);
+			glBindImageTexture(VOXEL_IMAGE_BINDING, g_voxelTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32UI);
+            glBindVertexArray(genericDrawVao);
+            glDrawArrays(GL_POINTS, 0, VOXEL_RESOLUTION * VOXEL_RESOLUTION * VOXEL_RESOLUTION);
+        }
+
+        if (g_settings.showAABB) {
+			glViewport(0, 0, windowWidth, windowHeight);
+            glEnable(GL_CULL_FACE);
+            glDisable(GL_DEPTH_TEST);
+			glProgramUniform3fv(g_drawAABBProgram, glGetUniformLocation(g_drawAABBProgram, "u_sceneAABB"), 2, glm::value_ptr(g_sceneAABB[0]));
+			glProgramUniformMatrix4fv(g_drawAABBProgram, glGetUniformLocation(g_drawAABBProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
+			glProgramUniformMatrix4fv(g_drawAABBProgram, glGetUniformLocation(g_drawAABBProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
+            glUseProgram(g_drawAABBProgram);
+            glBindVertexArray(genericDrawVao);
+            glDrawArrays(GL_LINES, 0, 24);
+        }
+
+        if (g_settings.showAxes) {
+			glViewport(0, 0, windowWidth, windowHeight);
+            GLfloat lineWidth;
+            glGetFloatv(GL_LINE_WIDTH, &lineWidth);
+            glLineWidth(5.f);
+            glDisable(GL_CULL_FACE);
+            glDisable(GL_DEPTH_TEST);
+			glProgramUniformMatrix4fv(g_drawAxesProgram, glGetUniformLocation(g_drawAxesProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
+			glProgramUniformMatrix4fv(g_drawAxesProgram, glGetUniformLocation(g_drawAxesProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
+            glUseProgram(g_drawAxesProgram);
+            glBindVertexArray(genericDrawVao);
+            glDrawArrays(GL_LINES, 0, 6);
+            glLineWidth(lineWidth);
+        }
+
+        ImGui::Begin("Settings");
+        ImGui::Checkbox("Show mesh", &g_settings.showMesh);
+        ImGui::Checkbox("Show wireframe", &g_settings.showWireframe);
+        ImGui::Checkbox("Show voxels", &g_settings.showVoxels);
+        ImGui::Checkbox("Show AABB", &g_settings.showAABB);
+        ImGui::Checkbox("Show axes", &g_settings.showAxes);
+        ImGui::End();
+
         /******************************************** END   DRAW ********************************************/
 
 		ImGuiIO& io = ImGui::GetIO();
@@ -408,7 +624,8 @@ int main()
 		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         // Swap the screen buffers
-        glfwSwapBuffers(window);
+        glfwSwapBuffers(g_window);
+        glfwPollEvents();
     }
 
     ImGui_ImplOpenGL3_Shutdown();
