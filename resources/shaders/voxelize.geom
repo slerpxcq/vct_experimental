@@ -11,10 +11,12 @@ in VS_OUT
 
 out GS_OUT
 {
-    flat int dominantAxis;
+    flat uint dominantAxis;
+    vec2 texCoord;
 } gs_out;
 
 uniform vec3 u_sceneAABB[2];
+uniform uint u_axis;
 
 /* Voxelization 
  * 1. Select the dominant axis 
@@ -22,7 +24,7 @@ uniform vec3 u_sceneAABB[2];
  * 3. In FS, swizzle back components and write to image
  */
 
-int DominantAxis()
+uint DominantAxis()
 {
 	vec3 p1 = gl_in[1].gl_Position.xyz - gl_in[0].gl_Position.xyz;
 	vec3 p2 = gl_in[2].gl_Position.xyz - gl_in[0].gl_Position.xyz;
@@ -43,15 +45,21 @@ vec3 ToNDC(vec3 v)
 
 void main()
 {
-    /* Select dominant axis */
-    gs_out.dominantAxis = DominantAxis();
+    uint dominantAxis = DominantAxis();
+
+    // Discard triangle if not current axis
+    if (dominantAxis != u_axis) 
+        return;
+
+    gs_out.dominantAxis = dominantAxis;
 
     for (int i = 0; i < 3; ++i) {
         vec3 ndcCoord = ToNDC(gl_in[i].gl_Position.xyz);
-        gl_Position.xyz = (gs_out.dominantAxis == 0) ? ndcCoord.zyx :
-                          (gs_out.dominantAxis == 1) ? ndcCoord.xzy :
+        gl_Position.xyz = (dominantAxis == 0) ? ndcCoord.zyx :
+                          (dominantAxis == 1) ? ndcCoord.xzy :
                           ndcCoord;
         gl_Position.w = 1;
+        gs_out.texCoord = gs_in[i].texCoord;
         EmitVertex();
     }
 }

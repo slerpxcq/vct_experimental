@@ -1,5 +1,7 @@
 #version 460 core
 
+#define EPSILON 0.0001f
+
 layout (points) in;
 layout (triangle_strip, max_vertices = 24) out;
 
@@ -39,7 +41,7 @@ void main()
 		4, 6, 0, 2, // front
 		1, 3, 5, 7); // back
 
-    if (gs_in[0].color.a == 0) 
+    if (abs(gs_in[0].color.a) < EPSILON) 
         return;
 
     vec3 voxelWorldPos = mix(u_sceneAABB[0], u_sceneAABB[1], gl_in[0].gl_Position.xyz / u_voxelResolution);
@@ -53,8 +55,9 @@ void main()
     for (int i = 0; i < 6; ++i) {
         for (int j = 0; j < 4; ++j) {
             gl_Position = projectedVertices[indices[4 * i + j]];
-            // gs_out.color = gs_in[0].color;
-            gs_out.color = vec4(gl_in[0].gl_Position.xyz / u_voxelResolution, 1);
+            // gs_out.color = vec4(gs_in[0].color.a / 3, 0, 0, 1);
+            // gs_out.color = vec4(gl_in[0].gl_Position.xyz / u_voxelResolution, 1);
+            gs_out.color = vec4(gs_in[0].color.rgb, 1);
             EmitVertex();
         }
         EndPrimitive();

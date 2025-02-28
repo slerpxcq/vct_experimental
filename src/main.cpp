@@ -1,6 +1,6 @@
 #include "utils.h"
 
-#include <glad/gl.h>
+#include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
 #include <imgui.h>
@@ -20,6 +20,8 @@
 #include <assimp/mesh.h>
 
 #include <stb_image.h>
+
+#include <FileWatch.hpp>
 
 #include <iostream>
 #include <vector>
@@ -73,6 +75,7 @@ struct Settings
     bool showWireframe{ false };
     bool showMesh{ true };
     bool showAxes{ false };
+    bool conservativeVoxelization{ false };
 };
 
 Settings g_settings;
@@ -175,20 +178,20 @@ void LinkProgram(GLuint program)
 
 void LoadShaders()
 {
-    constexpr const char* BASIC_VS_PATH = "resources/shaders/basic.vert";
-    constexpr const char* BASIC_FS_PATH = "resources/shaders/basic.frag";
-    constexpr const char* QUAD_VS_PATH = "resources/shaders/quad.vert";
-    constexpr const char* QUAD_FS_PATH = "resources/shaders/quad.frag";
-    constexpr const char* DRAW_AABB_VS_PATH = "resources/shaders/draw_aabb.vert";
-    constexpr const char* DRAW_AABB_FS_PATH = "resources/shaders/draw_aabb.frag";
-    constexpr const char* DRAW_AXES_VS_PATH = "resources/shaders/draw_axes.vert";
-    constexpr const char* DRAW_AXES_FS_PATH = "resources/shaders/draw_axes.frag";
-    constexpr const char* VOXELIZE_VS_PATH = "resources/shaders/voxelize.vert";
-    constexpr const char* VOXELIZE_GS_PATH = "resources/shaders/voxelize.geom";
-    constexpr const char* VOXELIZE_FS_PATH = "resources/shaders/voxelize.frag";
-    constexpr const char* DRAW_VOXELS_VS_PATH = "resources/shaders/draw_voxels.vert";
-    constexpr const char* DRAW_VOXELS_GS_PATH = "resources/shaders/draw_voxels.geom";
-    constexpr const char* DRAW_VOXELS_FS_PATH = "resources/shaders/draw_voxels.frag";
+    static constexpr const char* BASIC_VS_PATH = "resources/shaders/basic.vert";
+    static constexpr const char* BASIC_FS_PATH = "resources/shaders/basic.frag";
+    static constexpr const char* QUAD_VS_PATH = "resources/shaders/quad.vert";
+    static constexpr const char* QUAD_FS_PATH = "resources/shaders/quad.frag";
+    static constexpr const char* DRAW_AABB_VS_PATH = "resources/shaders/draw_aabb.vert";
+    static constexpr const char* DRAW_AABB_FS_PATH = "resources/shaders/draw_aabb.frag";
+    static constexpr const char* DRAW_AXES_VS_PATH = "resources/shaders/draw_axes.vert";
+    static constexpr const char* DRAW_AXES_FS_PATH = "resources/shaders/draw_axes.frag";
+    static constexpr const char* VOXELIZE_VS_PATH = "resources/shaders/voxelize.vert";
+    static constexpr const char* VOXELIZE_GS_PATH = "resources/shaders/voxelize.geom";
+    static constexpr const char* VOXELIZE_FS_PATH = "resources/shaders/voxelize.frag";
+    static constexpr const char* DRAW_VOXELS_VS_PATH = "resources/shaders/draw_voxels.vert";
+    static constexpr const char* DRAW_VOXELS_GS_PATH = "resources/shaders/draw_voxels.geom";
+    static constexpr const char* DRAW_VOXELS_FS_PATH = "resources/shaders/draw_voxels.frag";
 
     GLuint basicVs = CompileShader(BASIC_VS_PATH, GL_VERTEX_SHADER);
     GLuint basicFs = CompileShader(BASIC_FS_PATH, GL_FRAGMENT_SHADER);
@@ -250,6 +253,20 @@ void LoadShaders()
     glDeleteShader(drawVoxelsVs);
     glDeleteShader(drawVoxelsGs);
     glDeleteShader(drawVoxelsFs);
+
+    // static filewatch::FileWatch<std::string> watch(
+    //     BASIC_VS_PATH,
+    //     [&](const std::string& path, const filewatch::Event changeType) {
+    //         switch (changeType) {
+	// 		case filewatch::Event::modified:
+    //             glDetachShader(g_basicProgram, basicVs);
+    //             basicVs = CompileShader(BASIC_VS_PATH, GL_VERTEX_SHADER);
+    //             glAttachShader(g_basicProgram, basicVs);
+    //             LinkProgram(g_basicProgram);
+    //             glDeleteShader(basicVs);
+    //             std::cout << "Shader \"" << BASIC_VS_PATH << "\" has been reloaded successfully\n";
+	// 			break;
+    //         }});
 }
 
 void MergeAABB(const aiScene* scene, glm::vec3* outAABB)
@@ -377,7 +394,7 @@ void LoadScene()
 	importer.FreeScene();
 }
 
-void CreateWindow()
+void InitWindow()
 {
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
@@ -392,17 +409,20 @@ void CreateWindow()
         std::terminate();
     }
 
-    int version = gladLoadGL(glfwGetProcAddress);
+    int version = gladLoadGL();
     if (version == 0) {
         std::cerr << "Failed to initialize OpenGL context" << std::endl;
         std::terminate();
     }
 }
 
-constexpr uint32_t VOXEL_RESOLUTION = 512;
+constexpr uint32_t VOXEL_RESOLUTION = 256;
 
 void VoxelizeScene()
 {
+    glm::vec4 clearColor{ 0.f, 0.f, 0.f, 0.f };
+    glClearTexImage(g_voxelTex, 0, GL_RGBA, GL_FLOAT, glm::value_ptr(clearColor));
+    assert(glGetError() == GL_NO_ERROR);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -415,13 +435,28 @@ void VoxelizeScene()
     glUseProgram(g_voxelizeProgram);
     glViewport(0, 0, VOXEL_RESOLUTION, VOXEL_RESOLUTION);
 
-    for (uint32_t i = 0; i < g_meshes.size(); ++i) {
-        glBindVertexArray(g_meshes[i].vao);
-        glDrawElements(GL_TRIANGLES, g_meshes[i].vertexCount, GL_UNSIGNED_INT, 0);
+    if (g_settings.conservativeVoxelization)
+        glEnable(GL_CONSERVATIVE_RASTERIZATION_NV);
+
+    // 1 pass for each axis
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+		glProgramUniform1ui(g_voxelizeProgram, glGetUniformLocation(g_voxelizeProgram, "u_axis"), axis);
+        for (uint32_t i = 0; i < g_meshes.size(); ++i) {
+            auto mat = g_materials[g_meshes[i].materialIndex];
+            for (uint32_t j = 0; j < 8; ++j) {
+                auto tex = mat.maps[j];
+                if (tex)
+                    glBindTextureUnit(j, tex);
+            }
+            glBindVertexArray(g_meshes[i].vao);
+            glDrawElements(GL_TRIANGLES, g_meshes[i].vertexCount, GL_UNSIGNED_INT, 0);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        }
     }
 
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+	glDisable(GL_CONSERVATIVE_RASTERIZATION_NV);
 }
 
 void UpdateCamera(float frameTimeMs)
@@ -456,8 +491,8 @@ void UpdateCamera(float frameTimeMs)
 }
 
 int main()
-{
-    CreateWindow();
+{ 
+    InitWindow();
     LoadShaders();
     LoadScene();
 
@@ -469,11 +504,11 @@ int main()
     // atomicImageAdd could only operate on integer images 
     constexpr GLuint VOXEL_IMAGE_BINDING = 0;
     glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelTex);
-    glTextureStorage3D(g_voxelTex, 1, GL_R32UI, 
+    glTextureStorage3D(g_voxelTex, 1, GL_RGBA32F, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION);
-    glBindImageTexture(VOXEL_IMAGE_BINDING, g_voxelTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    glBindImageTexture(VOXEL_IMAGE_BINDING, g_voxelTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
     assert(glGetError() == GL_NO_ERROR);
 
 
@@ -568,14 +603,14 @@ int main()
 
         if (g_settings.showVoxels) { // draw voxelized scene
 			glViewport(0, 0, windowWidth, windowHeight);
-            // glEnable(GL_CULL_FACE);
+            glDisable(GL_CULL_FACE);
             glEnable(GL_DEPTH_TEST);
 			glProgramUniform3fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_sceneAABB"), 2, glm::value_ptr(g_sceneAABB[0]));
 			glProgramUniform1ui(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_voxelResolution"), VOXEL_RESOLUTION);
 			glProgramUniformMatrix4fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
 			glProgramUniformMatrix4fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
             glUseProgram(g_drawVoxelsProgram);
-			glBindImageTexture(VOXEL_IMAGE_BINDING, g_voxelTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32UI);
+			glBindImageTexture(VOXEL_IMAGE_BINDING, g_voxelTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
             glBindVertexArray(genericDrawVao);
             glDrawArrays(GL_POINTS, 0, VOXEL_RESOLUTION * VOXEL_RESOLUTION * VOXEL_RESOLUTION);
         }
@@ -596,7 +631,7 @@ int main()
 			glViewport(0, 0, windowWidth, windowHeight);
             GLfloat lineWidth;
             glGetFloatv(GL_LINE_WIDTH, &lineWidth);
-            glLineWidth(5.f);
+            glLineWidth(1.f);
             glDisable(GL_CULL_FACE);
             glDisable(GL_DEPTH_TEST);
 			glProgramUniformMatrix4fv(g_drawAxesProgram, glGetUniformLocation(g_drawAxesProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
@@ -613,6 +648,7 @@ int main()
         ImGui::Checkbox("Show voxels", &g_settings.showVoxels);
         ImGui::Checkbox("Show AABB", &g_settings.showAABB);
         ImGui::Checkbox("Show axes", &g_settings.showAxes);
+        ImGui::Checkbox("Conservative voxelization", &g_settings.conservativeVoxelization);
         ImGui::End();
 
         /******************************************** END   DRAW ********************************************/

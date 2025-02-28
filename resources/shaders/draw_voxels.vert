@@ -1,6 +1,6 @@
 #version 460 core
 
-layout (r32ui, binding = 0) uniform coherent readonly uimage3D u_voxelImage;
+layout (rgba32f, binding = 0) uniform coherent readonly image3D u_voxelImage;
 uniform uint u_voxelResolution;
 
 /* Draw voxels
@@ -14,20 +14,12 @@ out VS_OUT
     vec4 color;
 } vs_out;
 
-vec4 UnpackColor(uint uColor)
-{
-    return vec4(((uColor & 0xff000000) >> 24) / 255,
-               ((uColor & 0xff0000) >> 16) / 255,
-               ((uColor & 0xff00) >> 8) / 255,
-               (uColor & 0xff) / 255);
-}
-
 void main()
 {
     ivec3 imageCoord = ivec3(gl_VertexID % u_voxelResolution,
                            (gl_VertexID / u_voxelResolution) % u_voxelResolution,
                             gl_VertexID / (u_voxelResolution * u_voxelResolution));
 
-    vs_out.color = UnpackColor(imageLoad(u_voxelImage, imageCoord).r);
+    vs_out.color = imageLoad(u_voxelImage, imageCoord);
     gl_Position = vec4(imageCoord, 1);
 }

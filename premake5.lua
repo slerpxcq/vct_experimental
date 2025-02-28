@@ -13,6 +13,7 @@ workspace "VCT_Experimental"
 	IncDir["assimp"] = "3rdparty/assimp/include"
 	IncDir["assimp_build"] = "3rdparty/assimp/build/include"
 	IncDir["stb"] = "3rdparty/stb"
+	IncDir["filewatch"] = "3rdparty/filewatch"
 
     group "3rdparty"
     include "3rdparty/glfw"
@@ -51,6 +52,7 @@ workspace "VCT_Experimental"
 			"%{IncDir.assimp}",
 			"%{IncDir.assimp_build}",
 			"%{IncDir.stb}",
+			"%{IncDir.filewatch}",
             "src"
         }
 
