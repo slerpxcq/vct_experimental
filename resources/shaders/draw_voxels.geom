@@ -55,8 +55,6 @@ void main()
     for (int i = 0; i < 6; ++i) {
         for (int j = 0; j < 4; ++j) {
             gl_Position = projectedVertices[indices[4 * i + j]];
-            // gs_out.color = vec4(gs_in[0].color.a / 3, 0, 0, 1);
-            // gs_out.color = vec4(gl_in[0].gl_Position.xyz / u_voxelResolution, 1);
             gs_out.color = vec4(gs_in[0].color.rgb, 1);
             EmitVertex();
         }

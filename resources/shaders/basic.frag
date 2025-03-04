@@ -21,6 +21,8 @@ in VS_OUT
 
 void main()
 {
+
+
     if (u_hasMap[0]) {
         vec4 color = vec4(texture(u_diffuseTex, fs_in.texCoord));
         if (u_hasMap[7]) {

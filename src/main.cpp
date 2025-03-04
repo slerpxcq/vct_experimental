@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "GPUProgram.h"
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -20,8 +21,6 @@
 #include <assimp/mesh.h>
 
 #include <stb_image.h>
-
-#include <FileWatch.hpp>
 
 #include <iostream>
 #include <vector>
@@ -71,6 +70,7 @@ struct Camera
 struct Settings
 {
     bool showVoxels{ false };
+    bool showVoxelNormal{ false };
     bool showAABB{ false };
     bool showWireframe{ false };
     bool showMesh{ true };
@@ -78,6 +78,20 @@ struct Settings
     bool conservativeVoxelization{ false };
 };
 
+struct DirectionalLight 
+{
+    glm::vec4 color;
+    glm::vec4 direction;
+};
+
+/* -------------- Global constants -------------- */
+constexpr uint32_t VOXEL_RESOLUTION = 256;
+constexpr GLuint VOXEL_ALBEDO_IMAGE_BINDING = 0;
+constexpr GLuint VOXEL_NORMAL_IMAGE_BINDING = 1;
+constexpr GLuint VOXEL_EMISSIVE_IMAGE_BINDING = 2;
+constexpr GLuint VOXEL_RADIANCE_IMAGE_BINDING = 3;
+
+/* -------------- Global variables -------------- */
 Settings g_settings;
 std::vector<Material> g_materials;
 std::vector<Mesh> g_meshes;
@@ -85,96 +99,20 @@ Camera g_camera;
 GLFWwindow* g_window;
 glm::vec3 g_sceneAABB[2];
 
-GLuint g_basicProgram;
-GLuint g_quadProgram;
-GLuint g_drawAABBProgram;
-GLuint g_drawAxesProgram;
-GLuint g_voxelizeProgram;
-GLuint g_drawVoxelsProgram;
+GPUProgram g_basicProgram;
+GPUProgram g_quadProgram;
+GPUProgram g_drawAABBProgram;
+GPUProgram g_drawAxesProgram;
+GPUProgram g_voxelizeProgram;
+GPUProgram g_drawVoxelsProgram;
+GPUProgram g_voxelDirectLightingProgram;
 
-GLuint g_voxelTex;
+GLuint g_voxelAlbedoTex;
+GLuint g_voxelNormalTex;
+GLuint g_voxelEmissiveTex;
+GLuint g_voxelRadianceTex;
 
-GLuint UploadTexture(void* img, uint32_t width, uint32_t height, uint32_t channels)
-{
-    GLuint tex = 0;
-    glCreateTextures(GL_TEXTURE_2D, 1, &tex);
-
-    switch (channels) {
-    case 1:
-        glTextureStorage2D(tex, 1, GL_R8, width, height);
-        glTextureSubImage2D(tex, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, img);
-        break;
-    case 2:
-        glTextureStorage2D(tex, 1, GL_RG8, width, height);
-        glTextureSubImage2D(tex, 0, 0, 0, width, height, GL_RG, GL_UNSIGNED_BYTE, img);
-        break;
-    case 3:
-        glTextureStorage2D(tex, 1, GL_RGB8, width, height);
-        glTextureSubImage2D(tex, 0, 0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, img);
-        break;
-    case 4:
-        glTextureStorage2D(tex, 1, GL_RGBA8, width, height);
-        glTextureSubImage2D(tex, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, img);
-        break;
-    default:
-        std::cerr << "Unsupported texture channel count\n";
-        std::terminate();
-        break;
-    }
-
-    glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    return tex;
-}
-
-std::string LoadText(const char* path)
-{
-    std::ifstream ifs{ path };
-    if (!ifs.is_open()) {
-        std::cerr << "Could not open file \"" << path << "\"\n";
-        std::terminate();
-    }
-    
-    std::stringstream ss;
-    ss << ifs.rdbuf();
-    return ss.str();
-}
-
-// Create and return the shader
-GLuint CompileShader(const char* srcPath, GLenum type)
-{
-    GLuint shader = glCreateShader(type);
-    auto src = LoadText(srcPath);
-    auto srcCstr = src.c_str();
-    glShaderSource(shader, 1, &srcCstr, nullptr);
-    glCompileShader(shader);
-
-    int ok = 0;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[512] = {0};
-        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
-        std::cerr << "Failed to compile shader: " << log << '\n';
-        std::terminate();
-    }
-
-    return shader;
-}
-
-void LinkProgram(GLuint program)
-{
-    glLinkProgram(program);
-
-    int ok = 0;
-    glGetProgramiv(program, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[512];
-        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
-        std::cerr << "Failed to link program: " << log << '\n';
-        std::terminate();
-    }
-}
+DirectionalLight g_directionalLight;
 
 void LoadShaders()
 {
@@ -192,81 +130,44 @@ void LoadShaders()
     static constexpr const char* DRAW_VOXELS_VS_PATH = "resources/shaders/draw_voxels.vert";
     static constexpr const char* DRAW_VOXELS_GS_PATH = "resources/shaders/draw_voxels.geom";
     static constexpr const char* DRAW_VOXELS_FS_PATH = "resources/shaders/draw_voxels.frag";
+    static constexpr const char* VOXEL_DIRECT_LIGHTING_CS_PATH = "resources/shaders/voxel_direct_lighting.comp";
 
-    GLuint basicVs = CompileShader(BASIC_VS_PATH, GL_VERTEX_SHADER);
-    GLuint basicFs = CompileShader(BASIC_FS_PATH, GL_FRAGMENT_SHADER);
-    GLuint quadVs = CompileShader(QUAD_VS_PATH, GL_VERTEX_SHADER);
-    GLuint quadFs = CompileShader(QUAD_FS_PATH, GL_FRAGMENT_SHADER);
-    GLuint drawAABBVs = CompileShader(DRAW_AABB_VS_PATH, GL_VERTEX_SHADER);
-    GLuint drawAABBFs = CompileShader(DRAW_AABB_FS_PATH, GL_FRAGMENT_SHADER);
-    GLuint drawAxesVs = CompileShader(DRAW_AXES_VS_PATH, GL_VERTEX_SHADER);
-    GLuint drawAxesFs = CompileShader(DRAW_AXES_FS_PATH, GL_FRAGMENT_SHADER);
-    GLuint voxelizeVs = CompileShader(VOXELIZE_VS_PATH, GL_VERTEX_SHADER);
-    GLuint voxelizeGs = CompileShader(VOXELIZE_GS_PATH, GL_GEOMETRY_SHADER);
-    GLuint voxelizeFs = CompileShader(VOXELIZE_FS_PATH, GL_FRAGMENT_SHADER);
-    GLuint drawVoxelsVs = CompileShader(DRAW_VOXELS_VS_PATH, GL_VERTEX_SHADER);
-    GLuint drawVoxelsGs = CompileShader(DRAW_VOXELS_GS_PATH, GL_GEOMETRY_SHADER);
-    GLuint drawVoxelsFs = CompileShader(DRAW_VOXELS_FS_PATH, GL_FRAGMENT_SHADER);
+	g_basicProgram.Init();
+	g_quadProgram.Init();
+	g_drawAABBProgram.Init();
+	g_drawAxesProgram.Init();
+	g_voxelizeProgram.Init();
+	g_drawVoxelsProgram.Init();
+	g_voxelDirectLightingProgram.Init();
 
-    g_basicProgram = glCreateProgram();
-    glAttachShader(g_basicProgram, basicVs);
-    glAttachShader(g_basicProgram, basicFs);
-    LinkProgram(g_basicProgram);
-    glDeleteShader(basicVs);
-    glDeleteShader(basicFs);
+    g_basicProgram.AttachShader(BASIC_VS_PATH, GPUProgram::VERTEX);
+    g_basicProgram.AttachShader(BASIC_FS_PATH, GPUProgram::FRAGMENT);
+    g_basicProgram.Link();
 
-    g_quadProgram = glCreateProgram();
-    glAttachShader(g_quadProgram, quadVs);
-    glAttachShader(g_quadProgram, quadFs);
-    LinkProgram(g_quadProgram);
-    glDeleteShader(quadVs);
-    glDeleteShader(quadFs);
+    g_quadProgram.AttachShader(QUAD_VS_PATH, GPUProgram::VERTEX);
+    g_quadProgram.AttachShader(QUAD_FS_PATH, GPUProgram::FRAGMENT);
+    g_quadProgram.Link();
 
-    g_drawAABBProgram = glCreateProgram();
-    glAttachShader(g_drawAABBProgram, drawAABBVs);
-    glAttachShader(g_drawAABBProgram, drawAABBFs);
-    LinkProgram(g_drawAABBProgram);
-    glDeleteShader(drawAABBVs);
-    glDeleteShader(drawAABBFs);
+    g_drawAABBProgram.AttachShader(DRAW_AABB_VS_PATH, GPUProgram::VERTEX);
+    g_drawAABBProgram.AttachShader(DRAW_AABB_FS_PATH, GPUProgram::FRAGMENT);
+    g_drawAABBProgram.Link();
 
-    g_drawAxesProgram = glCreateProgram();
-    glAttachShader(g_drawAxesProgram, drawAxesVs);
-    glAttachShader(g_drawAxesProgram, drawAxesFs);
-    LinkProgram(g_drawAxesProgram);
-    glDeleteShader(drawAxesVs);
-    glDeleteShader(drawAxesFs);
+    g_drawAxesProgram.AttachShader(DRAW_AXES_VS_PATH, GPUProgram::VERTEX);
+    g_drawAxesProgram.AttachShader(DRAW_AXES_FS_PATH, GPUProgram::FRAGMENT);
+    g_drawAxesProgram.Link();
 
-    g_voxelizeProgram = glCreateProgram();
-    glAttachShader(g_voxelizeProgram, voxelizeVs);
-    glAttachShader(g_voxelizeProgram, voxelizeGs);
-    glAttachShader(g_voxelizeProgram, voxelizeFs);
-    LinkProgram(g_voxelizeProgram);
-    glDeleteShader(voxelizeVs);
-    glDeleteShader(voxelizeGs);
-    glDeleteShader(voxelizeFs);
+    g_voxelizeProgram.AttachShader(VOXELIZE_VS_PATH, GPUProgram::VERTEX);
+    g_voxelizeProgram.AttachShader(VOXELIZE_GS_PATH, GPUProgram::GEOMETRY);
+    g_voxelizeProgram.AttachShader(VOXELIZE_FS_PATH, GPUProgram::FRAGMENT);
+    g_voxelizeProgram.Link();
 
-    g_drawVoxelsProgram = glCreateProgram();
-    glAttachShader(g_drawVoxelsProgram, drawVoxelsVs);
-    glAttachShader(g_drawVoxelsProgram, drawVoxelsGs);
-    glAttachShader(g_drawVoxelsProgram, drawVoxelsFs);
-    LinkProgram(g_drawVoxelsProgram);
-    glDeleteShader(drawVoxelsVs);
-    glDeleteShader(drawVoxelsGs);
-    glDeleteShader(drawVoxelsFs);
+    g_drawVoxelsProgram.AttachShader(DRAW_VOXELS_VS_PATH, GPUProgram::VERTEX);
+    g_drawVoxelsProgram.AttachShader(DRAW_VOXELS_GS_PATH, GPUProgram::GEOMETRY);
+    g_drawVoxelsProgram.AttachShader(DRAW_VOXELS_FS_PATH, GPUProgram::FRAGMENT);
+    g_drawVoxelsProgram.Link();
 
-    // static filewatch::FileWatch<std::string> watch(
-    //     BASIC_VS_PATH,
-    //     [&](const std::string& path, const filewatch::Event changeType) {
-    //         switch (changeType) {
-	// 		case filewatch::Event::modified:
-    //             glDetachShader(g_basicProgram, basicVs);
-    //             basicVs = CompileShader(BASIC_VS_PATH, GL_VERTEX_SHADER);
-    //             glAttachShader(g_basicProgram, basicVs);
-    //             LinkProgram(g_basicProgram);
-    //             glDeleteShader(basicVs);
-    //             std::cout << "Shader \"" << BASIC_VS_PATH << "\" has been reloaded successfully\n";
-	// 			break;
-    //         }});
+    g_voxelDirectLightingProgram.AttachShader(VOXEL_DIRECT_LIGHTING_CS_PATH, GPUProgram::COMPUTE);
+    g_voxelDirectLightingProgram.Link();
 }
 
 void MergeAABB(const aiScene* scene, glm::vec3* outAABB)
@@ -277,8 +178,8 @@ void MergeAABB(const aiScene* scene, glm::vec3* outAABB)
         min = glm::min(min, Cast<glm::vec3>(scene->mMeshes[i]->mAABB.mMin));
         max = glm::max(max, Cast<glm::vec3>(scene->mMeshes[i]->mAABB.mMax));
     }
-    outAABB[0] = min;
-    outAABB[1] = max;
+    outAABB[0] = glm::vec3{ std::min({ min.x, min.y, min.z }) };
+    outAABB[1] = glm::vec3{ std::max({ max.x, max.y, max.z }) };
 }
 
 void LoadScene()
@@ -401,9 +302,9 @@ void InitWindow()
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    g_window = glfwCreateWindow(WIDTH, HEIGHT, "LearnOpenGL", NULL, NULL);
+    g_window = glfwCreateWindow(WIDTH, HEIGHT, "LearnOpenGL", nullptr, nullptr);
     glfwMakeContextCurrent(g_window);
-    if (g_window == NULL) {
+    if (g_window == nullptr) {
         std::cerr << "Failed to create GLFW g_window" << std::endl;
         glfwTerminate();
         std::terminate();
@@ -416,12 +317,12 @@ void InitWindow()
     }
 }
 
-constexpr uint32_t VOXEL_RESOLUTION = 256;
 
 void VoxelizeScene()
 {
-    glm::vec4 clearColor{ 0.f, 0.f, 0.f, 0.f };
-    glClearTexImage(g_voxelTex, 0, GL_RGBA, GL_FLOAT, glm::value_ptr(clearColor));
+    glm::vec4 clearColor{ 0.f };
+    glClearTexImage(g_voxelAlbedoTex, 0, GL_RGBA, GL_FLOAT, glm::value_ptr(clearColor));
+    glClearTexImage(g_voxelNormalTex, 0, GL_RGBA, GL_FLOAT, glm::value_ptr(clearColor));
     assert(glGetError() == GL_NO_ERROR);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -459,6 +360,16 @@ void VoxelizeScene()
 	glDisable(GL_CONSERVATIVE_RASTERIZATION_NV);
 }
 
+void ComputeVoxelDirectLighting()
+{
+    constexpr uint32_t WORKGROUP_SIZE = 8;
+    glUseProgram(g_voxelDirectLightingProgram);
+    uint32_t workgroupCount = VOXEL_RESOLUTION / WORKGROUP_SIZE;
+    glProgramUniform3fv(g_voxelDirectLightingProgram, glGetUniformLocation(g_voxelDirectLightingProgram, "u_lightColor"), 1, glm::value_ptr(g_directionalLight.color));
+    glProgramUniform3fv(g_voxelDirectLightingProgram, glGetUniformLocation(g_voxelDirectLightingProgram, "u_lightDirection"), 1, glm::value_ptr(g_directionalLight.direction));
+    glDispatchCompute(workgroupCount, workgroupCount, workgroupCount);
+}
+
 void UpdateCamera(float frameTimeMs)
 {
 	constexpr float MOVE_SPEED = 0.2f;
@@ -490,6 +401,11 @@ void UpdateCamera(float frameTimeMs)
 	}
 }
 
+void CheckShaderUpdate()
+{
+
+}
+
 int main()
 { 
     InitWindow();
@@ -502,15 +418,35 @@ int main()
 
     // Create texture for voxelization
     // atomicImageAdd could only operate on integer images 
-    constexpr GLuint VOXEL_IMAGE_BINDING = 0;
-    glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelTex);
-    glTextureStorage3D(g_voxelTex, 1, GL_RGBA32F, 
+    glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelAlbedoTex);
+    glTextureStorage3D(g_voxelAlbedoTex, 1, GL_RGBA16F, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION);
-    glBindImageTexture(VOXEL_IMAGE_BINDING, g_voxelTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
-    assert(glGetError() == GL_NO_ERROR);
+    glBindImageTexture(VOXEL_ALBEDO_IMAGE_BINDING, g_voxelAlbedoTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
 
+    glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelNormalTex);
+    glTextureStorage3D(g_voxelNormalTex, 1, GL_RGBA16F, 
+                       VOXEL_RESOLUTION, 
+                       VOXEL_RESOLUTION, 
+                       VOXEL_RESOLUTION);
+    glBindImageTexture(VOXEL_NORMAL_IMAGE_BINDING, g_voxelNormalTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
+
+    glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelEmissiveTex);
+    glTextureStorage3D(g_voxelEmissiveTex, 1, GL_RGBA16F, 
+                       VOXEL_RESOLUTION, 
+                       VOXEL_RESOLUTION, 
+                       VOXEL_RESOLUTION);
+    glBindImageTexture(VOXEL_EMISSIVE_IMAGE_BINDING, g_voxelEmissiveTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
+
+    glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelRadianceTex);
+    glTextureStorage3D(g_voxelRadianceTex, 1, GL_RGBA16F, 
+                       VOXEL_RESOLUTION, 
+                       VOXEL_RESOLUTION, 
+                       VOXEL_RESOLUTION);
+    glBindImageTexture(VOXEL_RADIANCE_IMAGE_BINDING, g_voxelRadianceTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
+
+    assert(glGetError() == GL_NO_ERROR);
 
     IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
@@ -537,6 +473,7 @@ int main()
 
     while (!glfwWindowShouldClose(g_window))
     {
+        GPUProgram::CheckShaderSourceUpdate();
 		int32_t windowWidth, windowHeight;
 		glfwGetWindowSize(g_window, &windowWidth, &windowHeight);
 
@@ -555,12 +492,11 @@ int main()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         ImGui::DockSpaceOverViewport(nullptr, ImGuiDockNodeFlags_PassthruCentralNode);
-
         /******************************************** END UPDATE ********************************************/
-
 
         /******************************************** BEGIN DRAW ********************************************/
 		VoxelizeScene();
+        ComputeVoxelDirectLighting();
 
         glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -609,8 +545,12 @@ int main()
 			glProgramUniform1ui(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_voxelResolution"), VOXEL_RESOLUTION);
 			glProgramUniformMatrix4fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
 			glProgramUniformMatrix4fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
+            if (!g_settings.showVoxelNormal) 
+				glProgramUniform1ui(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_drawMode"), 0);
+            else 
+				glProgramUniform1ui(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_drawMode"), 1);
             glUseProgram(g_drawVoxelsProgram);
-			glBindImageTexture(VOXEL_IMAGE_BINDING, g_voxelTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+			glBindImageTexture(VOXEL_ALBEDO_IMAGE_BINDING, g_voxelAlbedoTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
             glBindVertexArray(genericDrawVao);
             glDrawArrays(GL_POINTS, 0, VOXEL_RESOLUTION * VOXEL_RESOLUTION * VOXEL_RESOLUTION);
         }
@@ -643,12 +583,18 @@ int main()
         }
 
         ImGui::Begin("Settings");
+        ImGui::SeparatorText("Voxelization");
+        ImGui::Checkbox("Conservative voxelization", &g_settings.conservativeVoxelization);
+        ImGui::Checkbox("Show voxels", &g_settings.showVoxels);
+        ImGui::Checkbox("Show voxel normal", &g_settings.showVoxelNormal);
+        ImGui::SeparatorText("View");
         ImGui::Checkbox("Show mesh", &g_settings.showMesh);
         ImGui::Checkbox("Show wireframe", &g_settings.showWireframe);
-        ImGui::Checkbox("Show voxels", &g_settings.showVoxels);
         ImGui::Checkbox("Show AABB", &g_settings.showAABB);
         ImGui::Checkbox("Show axes", &g_settings.showAxes);
-        ImGui::Checkbox("Conservative voxelization", &g_settings.conservativeVoxelization);
+        ImGui::SeparatorText("Lights");
+        ImGui::SliderFloat3("Color", glm::value_ptr(g_directionalLight.color), 0.f, 1.f, "%.2f");
+        ImGui::SliderFloat3("Direction", glm::value_ptr(g_directionalLight.direction), -1.f, 1.f, "%.2f");
         ImGui::End();
 
         /******************************************** END   DRAW ********************************************/

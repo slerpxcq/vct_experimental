@@ -1,0 +1,64 @@
+#version 460 core
+
+#define EPSILON 0.0001f
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout (rgba16f, binding = 0) uniform coherent readonly image3D u_voxelAlbedoImage;
+layout (rgba16f, binding = 1) uniform coherent readonly image3D u_voxelNormalImage;
+layout (rgba16f, binding = 2) uniform coherent readonly image3D u_voxelEmissiveImage;
+layout (rgba16f, binding = 3) uniform coherent writeonly image3D u_voxelRadianceImage;
+
+uniform vec3 u_sceneAABB[2];
+uniform uint u_voxelResolution;
+
+// TODO: use SSBO for multiple lights 
+uniform vec3 u_lightColor;
+uniform vec3 u_lightDirection;
+
+vec3 VoxelCoordToWorld(vec3 coord)
+{
+    return mix(u_sceneAABB[0], u_sceneAABB[1], coord / u_voxelResolution);
+}
+
+vec3 WorldToVoxelCoord(vec3 coord)
+{
+    return ((coord - u_sceneAABB[0]) / (u_sceneAABB[1] - u_sceneAABB[0])) * u_voxelResolution;
+}
+
+vec4 BRDF(vec3 wi, vec3 wo, vec3 n)
+{
+    return vec4(0);
+}
+
+vec4 CalculateDirectionalLight(vec3 position, vec3 normal, vec3 albedo)
+{
+    return vec4(0);
+}
+
+vec4 CalculateDirectLighting(vec3 position, vec3 normal, vec3 albedo)
+{
+    vec4 accumLight = vec4(0);
+    accumLight += CalculateDirectionalLight(position, normal, albedo);
+    return accumLight;
+}
+
+void main()
+{
+    ivec3 voxelCoord = ivec3(gl_GlobalInvocationID);
+    vec4 albedo = imageLoad(u_voxelAlbedoImage, voxelCoord);
+
+    if (albedo.a < EPSILON) // voxel does not exist 
+        return;
+
+    albedo.a = 0.f;    
+    vec3 normal = normalize(imageLoad(u_voxelNormalImage, voxelCoord).rgb);
+    vec3 emissive = imageLoad(u_voxelEmissiveImage, voxelCoord).rgb;
+
+    if (any(greaterThan(albedo.rgb, vec3(0.f)))) {
+        vec3 worldPos = VoxelCoordToWorld(voxelCoord);
+        albedo = CalculateDirectLighting(worldPos, normal, albedo.rgb);
+    }
+
+    imageStore(u_voxelRadianceImage, voxelCoord, albedo);
+}

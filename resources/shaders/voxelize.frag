@@ -4,7 +4,9 @@
 
 layout (pixel_interlock_unordered) in;
 layout (pixel_center_integer) in vec4 gl_FragCoord;
-layout (rgba32f, binding = 0) uniform coherent image3D u_voxelImage;
+
+layout (rgba16f, binding = 0) uniform coherent image3D u_voxelColorImage;
+layout (rgba16f, binding = 1) uniform coherent image3D u_voxelNormalImage;
 
 layout (binding = 0) uniform sampler2D u_diffuseTex;
 layout (binding = 1) uniform sampler2D u_specularTex;
@@ -24,30 +26,41 @@ uniform uint u_voxelResolution;
 
 in GS_OUT
 {
-    flat uint dominantAxis;
+    vec3 normal;
     vec2 texCoord;
+    flat uint dominantAxis;
 } fs_in;
 
 // RGB stores color, A stores count
-void ImageAverageRGB(ivec3 imageCoord, vec3 color)
+void ImageAverageColor(ivec3 imageCoord, vec3 color)
 {
-    vec4 oldColor = imageLoad(u_voxelImage, imageCoord);
+    vec4 oldColor = imageLoad(u_voxelColorImage, imageCoord);
     vec4 newColor;
     newColor.a = oldColor.a + 1.f;
     newColor.rgb = (oldColor.a * oldColor.rgb + color) / newColor.a;
-    imageStore(u_voxelImage, imageCoord, newColor);
+    imageStore(u_voxelColorImage, imageCoord, newColor);
+}
+
+void ImageAverageNormal(ivec3 imageCoord, vec3 normal)
+{
+    vec4 oldNormal = imageLoad(u_voxelNormalImage, imageCoord);
+    vec4 newNormal;
+    newNormal.a = oldNormal.a + 1.f;
+    newNormal.rgb = (oldNormal.a * oldNormal.rgb + normal) / newNormal.a;
+    imageStore(u_voxelNormalImage, imageCoord, newNormal);
 }
 
 void main()
 {
-    ivec3 imageCoord;
-    imageCoord.xy = ivec2(gl_FragCoord.xy);
-    imageCoord.z = int(gl_FragCoord.z * u_voxelResolution);
-    imageCoord = (fs_in.dominantAxis == 0) ? imageCoord.zyx :
-                 (fs_in.dominantAxis == 1) ? imageCoord.xzy :
-                 imageCoord;
+    ivec3 voxelCoord;
+    voxelCoord.xy = ivec2(gl_FragCoord.xy);
+    voxelCoord.z = int(gl_FragCoord.z * u_voxelResolution);
+    voxelCoord = (fs_in.dominantAxis == 0) ? voxelCoord.zyx :
+                 (fs_in.dominantAxis == 1) ? voxelCoord.xzy :
+                 voxelCoord;
 
     beginInvocationInterlockARB();
-    ImageAverageRGB(imageCoord, texture(u_diffuseTex, fs_in.texCoord).rgb);
+    ImageAverageColor(voxelCoord, texture(u_diffuseTex, fs_in.texCoord).rgb);
+    ImageAverageNormal(voxelCoord, fs_in.normal);
     endInvocationInterlockARB();
 }

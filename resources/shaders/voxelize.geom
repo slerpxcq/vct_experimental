@@ -11,8 +11,9 @@ in VS_OUT
 
 out GS_OUT
 {
-    flat uint dominantAxis;
+    vec3 normal;
     vec2 texCoord;
+    flat uint dominantAxis;
 } gs_out;
 
 uniform vec3 u_sceneAABB[2];
@@ -38,7 +39,7 @@ uint DominantAxis()
 	       (nDY > nDX && nDY > nDZ) ? 1 : 2;
 }
 
-vec3 ToNDC(vec3 v)
+vec3 WorldToNDC(vec3 v)
 {
     return vec3(((v - u_sceneAABB[0]) / (u_sceneAABB[1] - u_sceneAABB[0]) - vec3(0.5)) * 2);
 }
@@ -54,12 +55,13 @@ void main()
     gs_out.dominantAxis = dominantAxis;
 
     for (int i = 0; i < 3; ++i) {
-        vec3 ndcCoord = ToNDC(gl_in[i].gl_Position.xyz);
+        vec3 ndcCoord = WorldToNDC(gl_in[i].gl_Position.xyz);
         gl_Position.xyz = (dominantAxis == 0) ? ndcCoord.zyx :
                           (dominantAxis == 1) ? ndcCoord.xzy :
                           ndcCoord;
         gl_Position.w = 1;
         gs_out.texCoord = gs_in[i].texCoord;
+        gs_out.normal = gs_in[i].normal;
         EmitVertex();
     }
 }
