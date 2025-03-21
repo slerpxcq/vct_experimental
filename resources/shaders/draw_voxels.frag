@@ -9,6 +9,5 @@ in GS_OUT
 
 void main()
 {
-    //f_color = vec4(fs_in.color, 0, 0, 1);
     f_color = fs_in.color;
 }

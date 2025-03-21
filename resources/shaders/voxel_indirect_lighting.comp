@@ -1,0 +1,120 @@
+#version 460 core
+
+#define EPSILON 0.0001f
+#define PI 3.14159265f
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout (rgba16f, binding = 0) uniform coherent readonly image3D u_voxelAlbedoImage;
+layout (rgba16f, binding = 1) uniform coherent readonly image3D u_voxelNormalImage;
+layout (rgba16f, binding = 2) uniform coherent readonly image3D u_voxelEmissiveImage;
+layout (rgba16f, binding = 3) uniform coherent image3D u_voxelRadianceImage;
+
+layout (binding = 4) uniform sampler3D u_voxelRadianceTexture;
+
+layout (std140, binding = 0) buffer G
+{
+    float traceOffset;
+} u_globals;
+
+uniform vec3 u_sceneAABB[2];
+uniform uint u_voxelResolution;
+
+uniform mat4 u_view;
+uniform mat4 u_proj;
+
+const vec3 coneDirections[] = 
+{
+    vec3(0.0f, 1.0f, 0.0f),
+    vec3(0.0f, 0.5f, 0.866025f),
+    vec3(0.754996f, 0.5f, -0.4330128f),
+    vec3(-0.754996f, 0.5f, -0.4330128f)
+};
+
+const float coneWeights[] = 
+{
+    PI / 3.0f,
+    2.0f * PI / 9.0f,
+    2.0f * PI / 9.0f,
+    2.0f * PI / 9.0f,
+};
+ 
+vec3 VoxelCoordToWorld(vec3 coord)
+{
+    return mix(u_sceneAABB[0], u_sceneAABB[1], coord / u_voxelResolution);
+}
+
+vec3 WorldToVoxelCoord(vec3 coord)
+{
+    return ((coord - u_sceneAABB[0]) / (u_sceneAABB[1] - u_sceneAABB[0])) * u_voxelResolution;
+}
+
+bool CheckBound(vec3 position)
+{
+    return all(lessThan(position, vec3(u_voxelResolution))) &&
+           all(greaterThan(position, vec3(0.f)));
+}
+
+// Trace one cone
+vec4 TraceCone(vec3 voxelCoord, vec3 direction)
+{
+    vec4 accumColor = vec4(0.f);
+    const float aperture = 1.f;
+    // move away from voxel to avoid self collision
+    float distance = u_globals.traceOffset;
+    float diameter = aperture;
+    vec3 position = voxelCoord + distance * direction;
+
+    while (accumColor.a < 1.f && CheckBound(position)) {
+        int mipLevel = int(log2(diameter));
+        if (mipLevel > 8)
+            break;
+        vec4 color = texelFetch(u_voxelRadianceTexture, ivec3(position / pow(2, mipLevel)), mipLevel);
+        accumColor += (1.f - accumColor.a) * color;
+        distance += diameter;
+        diameter = distance * aperture;
+        position += direction * distance;
+    }
+
+    return accumColor;
+}
+
+// Cone tracing is done in voxel space
+vec4 CalculateIndirectLighting(vec3 voxelCoord, vec3 normal)
+{
+    vec3 vertex = voxelCoord + vec3(0.5f) + normal;
+    vec4 accumLight = vec4(0.f);
+
+    // Generate a orthonormal basis
+    vec3 tmp = vec3(0, 1, 0);
+    if (abs(dot(tmp, normal)) > 0.999f) // too close
+        tmp = vec3(0, 0, 1);
+    vec3 tangent = normalize(tmp - dot(tmp, normal) * normal);
+    vec3 bitangent = cross(tangent, normal);
+
+    for (int i = 0; i < 4; ++i) {
+        vec3 coneDirection = normal + coneDirections[i].x * tangent + coneDirections[i].z * bitangent;
+        coneDirection = normalize(coneDirection);
+        accumLight += TraceCone(voxelCoord, normal);
+    }
+
+    return clamp(accumLight, 0.f, 1.f);
+}
+
+void main()
+{
+    ivec3 voxelCoord = ivec3(gl_GlobalInvocationID);
+    vec4 albedo = imageLoad(u_voxelAlbedoImage, voxelCoord);
+    
+    vec4 directLight = imageLoad(u_voxelRadianceImage, voxelCoord);
+    vec3 normal = normalize(imageLoad(u_voxelNormalImage, voxelCoord).xyz);
+
+    vec4 indirectLight = CalculateIndirectLighting(vec3(voxelCoord), normal);
+    indirectLight *= albedo;
+    vec4 radiance = directLight + indirectLight;
+    radiance.a = directLight.a;
+    // vec4 radiance = directLight;
+
+    // imageStore(u_voxelRadianceImage, voxelCoord, radiance);
+    imageStore(u_voxelRadianceImage, voxelCoord, radiance);
+}

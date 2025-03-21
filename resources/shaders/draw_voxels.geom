@@ -44,7 +44,7 @@ void main()
     if (abs(gs_in[0].color.a) < EPSILON) 
         return;
 
-    vec3 voxelWorldPos = mix(u_sceneAABB[0], u_sceneAABB[1], gl_in[0].gl_Position.xyz / u_voxelResolution);
+    vec3 voxelWorldPos = mix(u_sceneAABB[0], u_sceneAABB[1], (gl_in[0].gl_Position.xyz) / u_voxelResolution);
     vec3 voxelSize = (u_sceneAABB[1] - u_sceneAABB[0]) / u_voxelResolution;
 
     vec4 projectedVertices[8];

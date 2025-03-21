@@ -57,7 +57,6 @@ workspace "VCT_Experimental"
         }
 
         defines {
-
         }
 
         files { 

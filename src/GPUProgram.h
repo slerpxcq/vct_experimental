@@ -18,22 +18,18 @@ public:
 private:
 	using Watch = filewatch::FileWatch<std::string>;
 
+	struct Shader;
+	struct CallbackInfo {
+		GPUProgram* program{ nullptr };
+		Shader* shader{ nullptr };
+	};
+
 	struct Shader {
 		GLuint id{ 0 };
 		ShaderType type{};
-		std::optional<Watch> watch;
 		std::filesystem::path path;
-		struct CallbackInfo {
-			GPUProgram* program{ nullptr };
-			Shader* shader{ nullptr };
-		} callbackInfo;
-	};
-
-
-	struct ShaderUpdateInfo {
-		bool needUpdate{ false };
-		GPUProgram* program{ nullptr };
-		Shader* shader{ nullptr };
+		std::optional<Watch> watch;
+		CallbackInfo callbackInfo;
 	};
 
 public:
@@ -52,6 +48,7 @@ private:
 	GLuint m_id{ 0 };
 
 	static inline std::mutex s_shaderUpdateMutex;
-	static inline ShaderUpdateInfo s_shaderUpdateInfo;
+	static inline bool s_shaderNeedUpdate;
+	static inline CallbackInfo* s_shaderCallbackInfo;
 };
 

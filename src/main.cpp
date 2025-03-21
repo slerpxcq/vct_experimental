@@ -69,8 +69,18 @@ struct Camera
 
 struct Settings
 {
+    enum VoxelChannel {
+        ALBEDO,
+        NORMAL,
+        EMISSIVE,
+        RADIANCE,
+        OCCLUSION
+    };
+
     bool showVoxels{ false };
-    bool showVoxelNormal{ false };
+    int32_t showVoxelsMipLevel{ 0 };
+    bool indirectLighting{ false };
+    uint32_t voxelChannel{};
     bool showAABB{ false };
     bool showWireframe{ false };
     bool showMesh{ true };
@@ -84,6 +94,11 @@ struct DirectionalLight
     glm::vec4 direction;
 };
 
+struct GlobalUniformBlock // layout (std140)
+{
+    float traceOffset{ 1.f };
+};
+
 /* -------------- Global constants -------------- */
 constexpr uint32_t VOXEL_RESOLUTION = 256;
 constexpr GLuint VOXEL_ALBEDO_IMAGE_BINDING = 0;
@@ -92,11 +107,13 @@ constexpr GLuint VOXEL_EMISSIVE_IMAGE_BINDING = 2;
 constexpr GLuint VOXEL_RADIANCE_IMAGE_BINDING = 3;
 
 /* -------------- Global variables -------------- */
+GLFWwindow* g_window;
+bool g_windowFocused;
+
 Settings g_settings;
 std::vector<Material> g_materials;
 std::vector<Mesh> g_meshes;
 Camera g_camera;
-GLFWwindow* g_window;
 glm::vec3 g_sceneAABB[2];
 
 GPUProgram g_basicProgram;
@@ -106,13 +123,19 @@ GPUProgram g_drawAxesProgram;
 GPUProgram g_voxelizeProgram;
 GPUProgram g_drawVoxelsProgram;
 GPUProgram g_voxelDirectLightingProgram;
+GPUProgram g_voxelIndirectLightingProgram;
 
 GLuint g_voxelAlbedoTex;
 GLuint g_voxelNormalTex;
 GLuint g_voxelEmissiveTex;
 GLuint g_voxelRadianceTex;
 
+GlobalUniformBlock g_globalUniforms; // CPU side
+GLuint g_globalUniformBuffer; // GPU side handle
+
 DirectionalLight g_directionalLight;
+
+bool g_generateMipmapFlag;
 
 void LoadShaders()
 {
@@ -131,6 +154,7 @@ void LoadShaders()
     static constexpr const char* DRAW_VOXELS_GS_PATH = "resources/shaders/draw_voxels.geom";
     static constexpr const char* DRAW_VOXELS_FS_PATH = "resources/shaders/draw_voxels.frag";
     static constexpr const char* VOXEL_DIRECT_LIGHTING_CS_PATH = "resources/shaders/voxel_direct_lighting.comp";
+    static constexpr const char* VOXEL_INDIRECT_LIGHTING_CS_PATH = "resources/shaders/voxel_indirect_lighting.comp";
 
 	g_basicProgram.Init();
 	g_quadProgram.Init();
@@ -139,6 +163,7 @@ void LoadShaders()
 	g_voxelizeProgram.Init();
 	g_drawVoxelsProgram.Init();
 	g_voxelDirectLightingProgram.Init();
+	g_voxelIndirectLightingProgram.Init();
 
     g_basicProgram.AttachShader(BASIC_VS_PATH, GPUProgram::VERTEX);
     g_basicProgram.AttachShader(BASIC_FS_PATH, GPUProgram::FRAGMENT);
@@ -168,6 +193,9 @@ void LoadShaders()
 
     g_voxelDirectLightingProgram.AttachShader(VOXEL_DIRECT_LIGHTING_CS_PATH, GPUProgram::COMPUTE);
     g_voxelDirectLightingProgram.Link();
+
+    g_voxelIndirectLightingProgram.AttachShader(VOXEL_INDIRECT_LIGHTING_CS_PATH, GPUProgram::COMPUTE);
+    g_voxelIndirectLightingProgram.Link();
 }
 
 void MergeAABB(const aiScene* scene, glm::vec3* outAABB)
@@ -323,7 +351,7 @@ void VoxelizeScene()
     glm::vec4 clearColor{ 0.f };
     glClearTexImage(g_voxelAlbedoTex, 0, GL_RGBA, GL_FLOAT, glm::value_ptr(clearColor));
     glClearTexImage(g_voxelNormalTex, 0, GL_RGBA, GL_FLOAT, glm::value_ptr(clearColor));
-    assert(glGetError() == GL_NO_ERROR);
+    glClearTexImage(g_voxelEmissiveTex, 0, GL_RGBA, GL_FLOAT, glm::value_ptr(clearColor));
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -363,11 +391,33 @@ void VoxelizeScene()
 void ComputeVoxelDirectLighting()
 {
     constexpr uint32_t WORKGROUP_SIZE = 8;
+    glm::vec4 clearColor{ 0.f };
+    glClearTexImage(g_voxelRadianceTex, 0, GL_RGBA, GL_FLOAT, glm::value_ptr(clearColor));
     glUseProgram(g_voxelDirectLightingProgram);
     uint32_t workgroupCount = VOXEL_RESOLUTION / WORKGROUP_SIZE;
+    glProgramUniform1ui(g_voxelDirectLightingProgram, glGetUniformLocation(g_voxelDirectLightingProgram, "u_voxelResolution"), VOXEL_RESOLUTION);
     glProgramUniform3fv(g_voxelDirectLightingProgram, glGetUniformLocation(g_voxelDirectLightingProgram, "u_lightColor"), 1, glm::value_ptr(g_directionalLight.color));
     glProgramUniform3fv(g_voxelDirectLightingProgram, glGetUniformLocation(g_voxelDirectLightingProgram, "u_lightDirection"), 1, glm::value_ptr(g_directionalLight.direction));
     glDispatchCompute(workgroupCount, workgroupCount, workgroupCount);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    if (g_generateMipmapFlag) {
+        glGenerateTextureMipmap(g_voxelRadianceTex);
+        g_generateMipmapFlag = false;
+    }
+}
+
+void ComputeVoxelIndirectLighting()
+{
+    constexpr uint32_t WORKGROUP_SIZE = 8;
+    glm::vec4 clearColor{ 0.f };
+    // glClearTexImage(g_voxelRadianceTex, 0, GL_RGBA, GL_FLOAT, glm::value_ptr(clearColor));
+    glUseProgram(g_voxelIndirectLightingProgram);
+    uint32_t workgroupCount = VOXEL_RESOLUTION / WORKGROUP_SIZE;
+    glProgramUniform1ui(g_voxelIndirectLightingProgram, glGetUniformLocation(g_voxelIndirectLightingProgram, "u_voxelResolution"), VOXEL_RESOLUTION);
+    glProgramUniform3fv(g_voxelIndirectLightingProgram, glGetUniformLocation(g_voxelIndirectLightingProgram, "u_lightColor"), 1, glm::value_ptr(g_directionalLight.color));
+    glProgramUniform3fv(g_voxelIndirectLightingProgram, glGetUniformLocation(g_voxelIndirectLightingProgram, "u_lightIndirection"), 1, glm::value_ptr(g_directionalLight.direction));
+    glDispatchCompute(workgroupCount, workgroupCount, workgroupCount);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 }
 
 void UpdateCamera(float frameTimeMs)
@@ -401,53 +451,49 @@ void UpdateCamera(float frameTimeMs)
 	}
 }
 
-void CheckShaderUpdate()
+void CreateTextures()
 {
+    uint32_t mipLevel = Log2(VOXEL_RESOLUTION);
+    assert(mipLevel == 9);
 
-}
-
-int main()
-{ 
-    InitWindow();
-    LoadShaders();
-    LoadScene();
-
-    // VAO with no buffer binding, used when geometry is generated in shaders
-    GLuint genericDrawVao;
-    glCreateVertexArrays(1, &genericDrawVao);
-
-    // Create texture for voxelization
-    // atomicImageAdd could only operate on integer images 
     glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelAlbedoTex);
-    glTextureStorage3D(g_voxelAlbedoTex, 1, GL_RGBA16F, 
+    glTextureStorage3D(g_voxelAlbedoTex, mipLevel, GL_RGBA16F, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION);
     glBindImageTexture(VOXEL_ALBEDO_IMAGE_BINDING, g_voxelAlbedoTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
 
     glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelNormalTex);
-    glTextureStorage3D(g_voxelNormalTex, 1, GL_RGBA16F, 
+    glTextureStorage3D(g_voxelNormalTex, mipLevel, GL_RGBA16F, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION);
     glBindImageTexture(VOXEL_NORMAL_IMAGE_BINDING, g_voxelNormalTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
 
     glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelEmissiveTex);
-    glTextureStorage3D(g_voxelEmissiveTex, 1, GL_RGBA16F, 
+    glTextureStorage3D(g_voxelEmissiveTex, mipLevel, GL_RGBA16F, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION);
     glBindImageTexture(VOXEL_EMISSIVE_IMAGE_BINDING, g_voxelEmissiveTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
 
     glCreateTextures(GL_TEXTURE_3D, 1, &g_voxelRadianceTex);
-    glTextureStorage3D(g_voxelRadianceTex, 1, GL_RGBA16F, 
+    glTextureStorage3D(g_voxelRadianceTex, mipLevel, GL_RGBA16F, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION, 
                        VOXEL_RESOLUTION);
+    glTextureParameteri(g_voxelRadianceTex, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTextureParameteri(g_voxelRadianceTex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTextureParameteri(g_voxelRadianceTex, GL_TEXTURE_WRAP_R, GL_REPEAT);
+    glTextureParameteri(g_voxelRadianceTex, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTextureParameteri(g_voxelRadianceTex, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glBindImageTexture(VOXEL_RADIANCE_IMAGE_BINDING, g_voxelRadianceTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
 
     assert(glGetError() == GL_NO_ERROR);
+}
 
+void InitImGui()
+{
     IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
 
@@ -463,6 +509,26 @@ int main()
 
 	ImGui_ImplGlfw_InitForOpenGL(g_window, true);
 	ImGui_ImplOpenGL3_Init("#version 460");
+}
+
+int main()
+{ 
+    InitWindow();
+    LoadShaders();
+    LoadScene();
+
+    // VAO with no buffer binding, used when geometry is generated in shaders
+    GLuint genericDrawVao;
+    glCreateVertexArrays(1, &genericDrawVao);
+
+    glCreateBuffers(1, &g_globalUniformBuffer);
+    glNamedBufferStorage(g_globalUniformBuffer, sizeof(GlobalUniformBlock), nullptr, GL_DYNAMIC_STORAGE_BIT);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g_globalUniformBuffer);
+    assert(glGetError() == GL_NO_ERROR);
+
+    CreateTextures();
+
+    InitImGui();
 
     g_camera.matrix = glm::lookAt(glm::vec3{ 0, 0, 0 },
                                 glm::vec3{ 0, 0, -1 },
@@ -473,33 +539,71 @@ int main()
 
     while (!glfwWindowShouldClose(g_window))
     {
-        GPUProgram::CheckShaderSourceUpdate();
+		GPUProgram::CheckShaderSourceUpdate();
 		int32_t windowWidth, windowHeight;
 		glfwGetWindowSize(g_window, &windowWidth, &windowHeight);
 
-        /******************************************** BEGIN UPDATE ********************************************/
-        static glm::mat4 proj;
-        if (windowWidth > 0 && windowHeight > 0)
+		/******************************************** BEGIN UPDATE ********************************************/
+		static glm::mat4 proj;
+		if (windowWidth > 0 && windowHeight > 0)
 			proj = glm::perspective(glm::radians(60.f), static_cast<float>(windowWidth) / windowHeight, 0.1f, 10000.f);
 
-        auto now = std::chrono::high_resolution_clock::now();
-        frameTimeMs = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count() / 1000.f;
-        last = now;
+		auto now = std::chrono::high_resolution_clock::now();
+		frameTimeMs = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count() / 1000.f;
+		last = now;
 
-        UpdateCamera(frameTimeMs);
+		UpdateCamera(frameTimeMs);
 
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        ImGui::NewFrame();
-        ImGui::DockSpaceOverViewport(nullptr, ImGuiDockNodeFlags_PassthruCentralNode);
-        /******************************************** END UPDATE ********************************************/
+		ImGui_ImplOpenGL3_NewFrame();
+		ImGui_ImplGlfw_NewFrame();
+		ImGui::NewFrame();
+		ImGui::DockSpaceOverViewport(nullptr, ImGuiDockNodeFlags_PassthruCentralNode);
+		/******************************************** END UPDATE ********************************************/
 
-        /******************************************** BEGIN DRAW ********************************************/
+		/********************************************  BEGIN UI  ********************************************/
+		ImGui::Begin("Settings");
+		ImGui::SeparatorText("Voxelization");
+		ImGui::Checkbox("Conservative voxelization", &g_settings.conservativeVoxelization);
+		ImGui::Checkbox("Show voxels", &g_settings.showVoxels);
+        ImGui::SliderInt("Radiance voxel mip level", &g_settings.showVoxelsMipLevel, 0, 8);
+		ImGui::Checkbox("Indirect lighting", &g_settings.indirectLighting);
+		if (ImGui::BeginListBox("Voxel channel")) {
+			if (ImGui::Selectable("Albedo")) g_settings.voxelChannel = Settings::VoxelChannel::ALBEDO;
+			if (ImGui::Selectable("Normal")) g_settings.voxelChannel = Settings::VoxelChannel::NORMAL;
+			if (ImGui::Selectable("Emissive")) g_settings.voxelChannel = Settings::VoxelChannel::EMISSIVE;
+			if (ImGui::Selectable("Radiance")) g_settings.voxelChannel = Settings::VoxelChannel::RADIANCE;
+			if (ImGui::Selectable("Occlusion")) g_settings.voxelChannel = Settings::VoxelChannel::OCCLUSION;
+			ImGui::EndListBox();
+		}
+        if (ImGui::Button("Generate radiance mipmap")) {
+            g_generateMipmapFlag = true;
+        }
+        ImGui::SliderFloat("Trace cone/ray origin offset", &g_globalUniforms.traceOffset, 1.f, 3.f);
+
+		ImGui::SeparatorText("View");
+		ImGui::Checkbox("Show mesh", &g_settings.showMesh);
+		ImGui::Checkbox("Show wireframe", &g_settings.showWireframe);
+		ImGui::Checkbox("Show AABB", &g_settings.showAABB);
+		ImGui::Checkbox("Show axes", &g_settings.showAxes);
+
+		ImGui::SeparatorText("Lights");
+		ImGui::SliderFloat3("Color", glm::value_ptr(g_directionalLight.color), 0.f, 1.f, "%.2f");
+		ImGui::SliderFloat3("Direction", glm::value_ptr(g_directionalLight.direction), -1.f, 1.f, "%.2f");
+		ImGui::End();
+		/********************************************  END UI ********************************************/
+
+		/******************************************** BEGIN GLOBAL UNIFORM ********************************************/
+        glNamedBufferSubData(g_globalUniformBuffer, 0, sizeof(GlobalUniformBlock), &g_globalUniforms);
+		/******************************************** END GLOBAL UNIFORM ********************************************/
+
+		/******************************************** BEGIN DRAW ********************************************/
 		VoxelizeScene();
-        ComputeVoxelDirectLighting();
+		ComputeVoxelDirectLighting();
+        if (g_settings.indirectLighting)
+            ComputeVoxelIndirectLighting();
 
-        glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
 		if (g_settings.showWireframe) {
 			glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
@@ -508,106 +612,93 @@ int main()
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 		}
 
-        if (g_settings.showMesh) {
-            for (uint32_t i = 0; i < g_meshes.size(); ++i) {
-                uint32_t hasMap[8] = { 0 };
-                auto mat = g_materials[g_meshes[i].materialIndex];
-                for (uint32_t j = 0; j < 8; ++j) {
-                    auto tex = mat.maps[j];
-                    if (tex) {
-                        glBindTextureUnit(j, tex);
-                        hasMap[j] = 1;
-                    }
-                }
-                glViewport(0, 0, windowWidth, windowHeight);
-                glEnable(GL_DEPTH_TEST);
-                glProgramUniform1uiv(g_basicProgram, glGetUniformLocation(g_basicProgram, "u_hasMap"), 8, hasMap);
-                glProgramUniformMatrix4fv(g_basicProgram, glGetUniformLocation(g_basicProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
-                glProgramUniformMatrix4fv(g_basicProgram, glGetUniformLocation(g_basicProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
-                glBindVertexArray(g_meshes[i].vao);
-                glUseProgram(g_basicProgram);
-                if (mat.twoSided) {
-                    glDisable(GL_CULL_FACE);
-                }
-                else {
-                    glEnable(GL_CULL_FACE);
-                    glFrontFace(GL_CCW);
-                }
-                glDrawElements(GL_TRIANGLES, g_meshes[i].vertexCount, GL_UNSIGNED_INT, 0);
-            }
-        }
+		if (g_settings.showMesh) {
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+			for (uint32_t i = 0; i < g_meshes.size(); ++i) {
+				uint32_t hasMap[8] = { 0 };
+				auto mat = g_materials[g_meshes[i].materialIndex];
+				for (uint32_t j = 0; j < 8; ++j) {
+					auto tex = mat.maps[j];
+					if (tex) {
+						glBindTextureUnit(j, tex);
+						hasMap[j] = 1;
+					}
+				}
+				glViewport(0, 0, windowWidth, windowHeight);
+				glEnable(GL_DEPTH_TEST);
+				glProgramUniform1uiv(g_basicProgram, glGetUniformLocation(g_basicProgram, "u_hasMap"), 8, hasMap);
+				glProgramUniformMatrix4fv(g_basicProgram, glGetUniformLocation(g_basicProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
+				glProgramUniformMatrix4fv(g_basicProgram, glGetUniformLocation(g_basicProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
+				glBindVertexArray(g_meshes[i].vao);
+				glUseProgram(g_basicProgram);
+				if (mat.twoSided) {
+					glDisable(GL_CULL_FACE);
+				}
+				else {
+					glEnable(GL_CULL_FACE);
+					glFrontFace(GL_CCW);
+				}
+				glDrawElements(GL_TRIANGLES, g_meshes[i].vertexCount, GL_UNSIGNED_INT, 0);
+			}
+			glDisable(GL_BLEND);
+		}
 
-        if (g_settings.showVoxels) { // draw voxelized scene
+		if (g_settings.showVoxels) { // draw voxelized scene
 			glViewport(0, 0, windowWidth, windowHeight);
-            glDisable(GL_CULL_FACE);
-            glEnable(GL_DEPTH_TEST);
+			glDisable(GL_CULL_FACE);
+			glEnable(GL_DEPTH_TEST);
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 			glProgramUniform3fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_sceneAABB"), 2, glm::value_ptr(g_sceneAABB[0]));
 			glProgramUniform1ui(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_voxelResolution"), VOXEL_RESOLUTION);
 			glProgramUniformMatrix4fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
 			glProgramUniformMatrix4fv(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
-            if (!g_settings.showVoxelNormal) 
-				glProgramUniform1ui(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_drawMode"), 0);
-            else 
-				glProgramUniform1ui(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_drawMode"), 1);
-            glUseProgram(g_drawVoxelsProgram);
+			glProgramUniform1ui(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_drawMode"), g_settings.voxelChannel);
+			glProgramUniform1ui(g_drawVoxelsProgram, glGetUniformLocation(g_drawVoxelsProgram, "u_mipLevel"), g_settings.showVoxelsMipLevel);
+			glUseProgram(g_drawVoxelsProgram);
 			glBindImageTexture(VOXEL_ALBEDO_IMAGE_BINDING, g_voxelAlbedoTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
-            glBindVertexArray(genericDrawVao);
-            glDrawArrays(GL_POINTS, 0, VOXEL_RESOLUTION * VOXEL_RESOLUTION * VOXEL_RESOLUTION);
-        }
+            glBindTextureUnit(4, g_voxelRadianceTex);
+			glBindVertexArray(genericDrawVao);
+			glDrawArrays(GL_POINTS, 0, VOXEL_RESOLUTION * VOXEL_RESOLUTION * VOXEL_RESOLUTION);
+			glDisable(GL_BLEND);
+		}
 
-        if (g_settings.showAABB) {
+		if (g_settings.showAABB) {
 			glViewport(0, 0, windowWidth, windowHeight);
-            glEnable(GL_CULL_FACE);
-            glDisable(GL_DEPTH_TEST);
+			glEnable(GL_CULL_FACE);
+			glDisable(GL_DEPTH_TEST);
 			glProgramUniform3fv(g_drawAABBProgram, glGetUniformLocation(g_drawAABBProgram, "u_sceneAABB"), 2, glm::value_ptr(g_sceneAABB[0]));
 			glProgramUniformMatrix4fv(g_drawAABBProgram, glGetUniformLocation(g_drawAABBProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
 			glProgramUniformMatrix4fv(g_drawAABBProgram, glGetUniformLocation(g_drawAABBProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
-            glUseProgram(g_drawAABBProgram);
-            glBindVertexArray(genericDrawVao);
-            glDrawArrays(GL_LINES, 0, 24);
-        }
+			glUseProgram(g_drawAABBProgram);
+			glBindVertexArray(genericDrawVao);
+			glDrawArrays(GL_LINES, 0, 24);
+		}
 
-        if (g_settings.showAxes) {
+		if (g_settings.showAxes) {
 			glViewport(0, 0, windowWidth, windowHeight);
-            GLfloat lineWidth;
-            glGetFloatv(GL_LINE_WIDTH, &lineWidth);
-            glLineWidth(1.f);
-            glDisable(GL_CULL_FACE);
-            glDisable(GL_DEPTH_TEST);
+			GLfloat lineWidth;
+			glGetFloatv(GL_LINE_WIDTH, &lineWidth);
+			glLineWidth(1.f);
+			glDisable(GL_CULL_FACE);
+			glDisable(GL_DEPTH_TEST);
 			glProgramUniformMatrix4fv(g_drawAxesProgram, glGetUniformLocation(g_drawAxesProgram, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
 			glProgramUniformMatrix4fv(g_drawAxesProgram, glGetUniformLocation(g_drawAxesProgram, "u_view"), 1, GL_FALSE, glm::value_ptr(glm::inverse(g_camera.matrix)));
-            glUseProgram(g_drawAxesProgram);
-            glBindVertexArray(genericDrawVao);
-            glDrawArrays(GL_LINES, 0, 6);
-            glLineWidth(lineWidth);
-        }
+			glUseProgram(g_drawAxesProgram);
+			glBindVertexArray(genericDrawVao);
+			glDrawArrays(GL_LINES, 0, 6);
+			glLineWidth(lineWidth);
+		}
 
-        ImGui::Begin("Settings");
-        ImGui::SeparatorText("Voxelization");
-        ImGui::Checkbox("Conservative voxelization", &g_settings.conservativeVoxelization);
-        ImGui::Checkbox("Show voxels", &g_settings.showVoxels);
-        ImGui::Checkbox("Show voxel normal", &g_settings.showVoxelNormal);
-        ImGui::SeparatorText("View");
-        ImGui::Checkbox("Show mesh", &g_settings.showMesh);
-        ImGui::Checkbox("Show wireframe", &g_settings.showWireframe);
-        ImGui::Checkbox("Show AABB", &g_settings.showAABB);
-        ImGui::Checkbox("Show axes", &g_settings.showAxes);
-        ImGui::SeparatorText("Lights");
-        ImGui::SliderFloat3("Color", glm::value_ptr(g_directionalLight.color), 0.f, 1.f, "%.2f");
-        ImGui::SliderFloat3("Direction", glm::value_ptr(g_directionalLight.direction), -1.f, 1.f, "%.2f");
-        ImGui::End();
-
-        /******************************************** END   DRAW ********************************************/
-
-		ImGuiIO& io = ImGui::GetIO();
-		io.DisplaySize = ImVec2(windowWidth, windowHeight);
-
+		/******************************************** END   DRAW ********************************************/
+		ImGui::GetIO().DisplaySize = ImVec2(windowWidth, windowHeight);
+		ImGui::EndFrame();
 		ImGui::Render();
 		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        // Swap the screen buffers
-        glfwSwapBuffers(g_window);
-        glfwPollEvents();
+		glfwSwapBuffers(g_window);
+		glfwPollEvents();
     }
 
     ImGui_ImplOpenGL3_Shutdown();

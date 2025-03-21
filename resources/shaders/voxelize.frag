@@ -46,7 +46,7 @@ void ImageAverageNormal(ivec3 imageCoord, vec3 normal)
     vec4 oldNormal = imageLoad(u_voxelNormalImage, imageCoord);
     vec4 newNormal;
     newNormal.a = oldNormal.a + 1.f;
-    newNormal.rgb = (oldNormal.a * oldNormal.rgb + normal) / newNormal.a;
+    newNormal.rgb = (oldNormal.a * oldNormal.xyz + normal) / newNormal.a;
     imageStore(u_voxelNormalImage, imageCoord, newNormal);
 }
 

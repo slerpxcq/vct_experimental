@@ -45,20 +45,19 @@ void GPUProgram::AttachShader(const std::filesystem::path& path, ShaderType type
 	glAttachShader(m_id, shader.id);
 	auto result = CompileShader(shader.id, path.string().c_str());
 	if (result != std::nullopt) {
-		std::cerr << "Failed to compile shader \"" << path << "\"; Message: " << *result << '\n';
+		std::cerr << "Failed to compile shader \"" << path << "\": " << *result << '\n';
 	}
 
 	shader.callbackInfo.program = this;
 	shader.callbackInfo.shader = &shader;
-	// NOTE: DO NOT USE the first argument, it only contains the filename no the path!
+	// NOTE: DO NOT USE the first argument, it only contains the filename not the path!
 	shader.watch.emplace(path.string(), [](const std::string&, const filewatch::Event event, void* user_pointer) {
-		auto info = static_cast<Shader::CallbackInfo*>(user_pointer);
+		auto info = static_cast<CallbackInfo*>(user_pointer);
 		switch (event) {
 		case filewatch::Event::modified:
 			std::lock_guard l{ s_shaderUpdateMutex };
-			s_shaderUpdateInfo.needUpdate = true;
-			s_shaderUpdateInfo.program = info->program;
-			s_shaderUpdateInfo.shader = info->shader;
+			s_shaderNeedUpdate = true;
+			s_shaderCallbackInfo = info;
 		    break;
 		}}, &shader.callbackInfo);
 }
@@ -67,7 +66,7 @@ bool GPUProgram::Link()
 {
 	auto result = LinkProgram(m_id);
 	if (result != std::nullopt) {
-		std::cerr << "Failed to link program; Message: " << *result << '\n';
+		std::cerr << "Failed to link program: " << *result << '\n';
 		return false;
 	}
 
@@ -77,17 +76,17 @@ bool GPUProgram::Link()
 void GPUProgram::CheckShaderSourceUpdate()
 {
 	std::lock_guard l{ s_shaderUpdateMutex };
-	if (!s_shaderUpdateInfo.needUpdate)
+	if (!s_shaderNeedUpdate)
 		return;
 
-	s_shaderUpdateInfo.needUpdate = false;
-	auto shader = s_shaderUpdateInfo.shader;
-	auto program = s_shaderUpdateInfo.program;
+	s_shaderNeedUpdate = false;
+
+	auto shader = s_shaderCallbackInfo->shader;
+	auto program = s_shaderCallbackInfo->program;
 	GLuint newID = glCreateShader(ToGLShaderType(shader->type));
-	assert(glGetError() == GL_NO_ERROR);
 	auto result = CompileShader(newID, shader->path.string().c_str());
 	if (result != std::nullopt) {
-		std::cerr << "Failed to compile shader " << shader->path << "; Message: " << *result << '\n';
+		std::cerr << "Failed to compile shader " << shader->path << ":\n" << *result << '\n';
 	} 
 	else {
 		glDetachShader(program->m_id, shader->id);
